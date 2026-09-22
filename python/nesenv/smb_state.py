@@ -199,6 +199,14 @@ def _enemies(ram: bytes, mario_x: int, mario_y: int) -> tuple[list[dict], dict |
         elif kind in ENEMY_NAMES:
             if ram[ENEMY_STATE + i] & 0x20:   # already stomped / kicked away
                 continue
+            if kind == 0x0D:
+                # A piranha plant rides up and down inside its pipe; only the "out" part
+                # of the cycle can hurt, and that is what the model should hear about.
+                # It is hidden once its top is at or below the pipe's top tile.
+                pipe_top = next((r for r in range(TILE_ROWS) if _solid(_tile(ram, ex + 8, r))), TILE_ROWS)
+                hidden = ey >= 16 * pipe_top + 8
+                entry["level"] = "hidden inside its pipe" if hidden else "out of its pipe"
+                entry["_hidden"] = hidden
             hostile.append({"type": ENEMY_NAMES[kind], **entry})
     hostile.sort(key=lambda e: e["distance_tiles"])
     return hostile, powerup
@@ -226,17 +234,18 @@ def _items(ram: bytes, mario_x: int, feet_row: int) -> list[dict]:
             # coin only needs Mario's body to pass through it.
             needed = height - 1
             reachable = needed <= REACH_TILES
-            # Too high from the ground? Maybe there is something to stand on under it
-            # (the classic ? block above a row of bricks). Code will climb onto that first.
+            # Anything solid between Mario and the item (the classic ? block above a row
+            # of bricks, a coin sitting on a platform) means jumping from here just bonks:
+            # code climbs onto that ledge first, if it can be reached.
             platform = None
-            if not reachable:
-                for prow in range(row + 1, feet_row):
-                    if _solid(_tile(ram, col * 16, prow)):
-                        platform = feet_row - prow       # its top, in tiles above the ground
-                        break
-                if platform is not None and platform <= REACH_TILES and (platform - height) >= -REACH_TILES - 1:
-                    reachable = True
-                    what += f", above a ledge {platform} tiles up that Mario can stand on"
+            for prow in range(row + 1, feet_row):
+                if _solid(_tile(ram, col * 16, prow)):
+                    platform = feet_row - prow       # its top, in tiles above the ground
+                    break
+            if platform is not None:
+                reachable = platform <= REACH_TILES and (platform - height) >= -REACH_TILES - 1
+                if reachable:
+                    what += f", on top of a ledge {platform} tiles up that Mario can stand on"
             found.append({
                 "kind": kind,
                 "what": what,
@@ -284,6 +293,22 @@ def read_scene(nes: Nes, ground_row: int | None = None) -> dict:
     for n, item in enumerate(items, start=1):
         item["id"] = f"item_{n}"
 
+    # The nearest pipe top within a few tiles either side: a dead end usually means the
+    # way on is down one of these (1-2's exit), so code needs to know where to stand.
+    pipe_top = None
+    for c in range(-5, 6):
+        px = x + 8 + 16 * c
+        for row in range(TILE_ROWS):
+            if _tile(ram, px, row) == 0x10:            # top-left tile of a pipe
+                cand = {"dx_px": (px // 16) * 16 + 16 - (x + 8), "height": feet_row - row}
+                if pipe_top is None or abs(cand["dx_px"]) < abs(pipe_top["dx_px"]):
+                    pipe_top = cand
+                break
+    piranha_out_ahead = any(e["type"] == "piranha plant" and e["direction"] == "ahead"
+                            and e["distance_tiles"] <= 4 and not e.pop("_hidden")
+                            for e in hostile if e["type"] == "piranha plant") or False
+    for e in hostile:
+        e.pop("_hidden", None)
     scene = {
         "mario": {
             "size": "big" if big else "small",
@@ -317,9 +342,11 @@ def read_scene(nes: Nes, ground_row: int | None = None) -> dict:
             n += 1
         return n
     headroom = free_above(x + 8)   # free tiles above Mario's head in his own column
+    headroom_ahead = min(free_above(x + 8 + 16 * c) for c in range(0, 4))   # the next three too
     scene["_meta"] = {
         "x": x, "y": y, "feet_row": feet_row, "on_ground": on_ground, "ceiling": ceiling,
-        "headroom": headroom,
+        "headroom": headroom, "headroom_ahead": headroom_ahead,
+        "piranha_out_ahead": piranha_out_ahead, "pipe_top": pipe_top,
         "controllable": ram[PLAYER_STATE] == 8 and ram[OPER_MODE] == 1 and ram[OPER_TASK] == 3,
         "dying": ram[PLAYER_STATE] in (6, 0x0B) or ram[PLAYER_Y_PAGE] > 1,
         "flagpole": ram[OPER_TASK] == 3 and (float_state == 3 or ram[PLAYER_STATE] in (4, 5)),

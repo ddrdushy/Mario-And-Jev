@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .core import A, B, LEFT, RIGHT, START, Nes
+from .core import A, B, DOWN, LEFT, RIGHT, START, Nes
 from .movie import write_movie
 from .smb_state import OPER_MODE, REACH_TILES, read_scene
 
@@ -206,8 +206,6 @@ class HeuristicPolicy:
         for f in terrain:
             if f["distance_tiles"] > 2:
                 continue
-            if f["kind"] in ("wall", "pipe") and f.get("first_step_tiles", f["height_tiles"]) > UNJUMPABLE:
-                return Decision("run_left", 1.0, self.name, hazard_first=1.0)
             if f["kind"] == "pit" or (f["kind"] in ("wall", "pipe") and f["height_tiles"] >= 2):
                 return Decision("full_jump", 1.0, self.name, hazard_first=1.0)
             if f["kind"] == "wall":
@@ -504,7 +502,7 @@ def plan_collect(item: dict, meta: dict) -> list[int] | None:
     vx = meta["vx"]
     if not item["_reachable"]:
         return None
-    if item.get("_platform") and height - 1 > REACH_TILES:
+    if item.get("_platform"):
         return plan_climb(item["_platform"], dx, vx)
     if item["kind"] == "coin" and height <= 1:
         return [RIGHT] * 4                       # ground-level coin: just walk through it
@@ -563,6 +561,8 @@ class Player:
         self.seek: tuple[int, int, int] | None = None   # (block column, A frames, deadline)
         self.no_collect_until = 0     # after a seek is abandoned for an enemy, run the move instead
         self.retreat: tuple[int, int] | None = None     # (feet row when run_left began, deadline)
+        self.pushed_at = -1           # x // 32 where Mario last tried walking into a tall wall
+        self.enter_pipe: tuple[dict, int] | None = None   # (pipe top to go down, deadline)
         self.coins = 0
         self.outcome: str | None = None   # set only when the whole game is over
         self.lives_played = 0
@@ -588,6 +588,44 @@ class Player:
                 "world": meta["world"], "stage": meta["stage"], "coins": meta["coins"],
             })
         self.max_x, self.stall, self.queue, self.seek = 0, 0, [], None
+
+    def _pipe_mask(self, scene: dict) -> int | None:
+        """Frame-by-frame: get on top of the remembered pipe, then hold DOWN. None when done."""
+        if not self.enter_pipe:
+            return None
+        target, deadline = self.enter_pipe
+        meta = scene["_meta"]
+        pipe = meta["pipe_top"]
+        if self.frame > deadline or pipe is None or not meta["on_ground"]:
+            if self.frame > deadline or pipe is None:
+                self.enter_pipe = None
+            return None if self.frame > deadline or pipe is None else 0
+        dx, height = pipe["dx_px"], pipe["height"]
+        if height == 0:                                   # standing on it
+            # The game only takes DOWN with Mario's centre within a few px of the pipe's.
+            if abs(meta["vx"]) > STOPPED:
+                return LEFT if meta["vx"] > 0 else RIGHT
+            if abs(dx) <= 3:
+                self.queue = [DOWN] * 40
+                self.enter_pipe = None
+                return self.queue.pop(0)
+            self.queue = [RIGHT if dx > 0 else LEFT] * (5 if abs(dx) > 8 else 3) + [0] * 12
+            return self.queue.pop(0)
+        if dx < 0:
+            # The pipe is behind Mario: hop up onto it from this side, drifting left.
+            if abs(meta["vx"]) > STOPPED:
+                plan = [LEFT if meta["vx"] > 0 else RIGHT, 0]
+            elif dx < -48:
+                plan = [LEFT] * 4
+            else:
+                plan = [A | LEFT] * 30 + [LEFT] * 10 + [0] * 6
+        else:
+            plan = plan_climb(height, dx, meta["vx"])
+        if plan is None:
+            self.enter_pipe = None
+            return None
+        self.queue = plan
+        return self.queue.pop(0)
 
     def _seek_mask(self, scene: dict) -> int | None:
         """Frame-by-frame positioning under a block, then the jump. None when not seeking."""
@@ -631,7 +669,12 @@ class Player:
             return 0
         level = (meta["world"], meta["stage"])
         if self.level is not None and level != self.level:
+            if not self.flagged:
+                # No flagpole on the way here: a pipe or a warp zone took Mario onward.
+                self.levels_cleared += 1
+                self._life_ended(f"warped to {level[0]}-{level[1]}", meta)
             self.max_x, self.stall, self.queue, self.flagged, self.seek, self.retreat = 0, 0, [], False, None, None
+            self.enter_pipe = None
         self.level = level
         if meta["flagpole"] and not self.flagged and self.max_x > 0:
             self.flagged = True
@@ -659,6 +702,9 @@ class Player:
                 self.retreat = None
             else:
                 return LEFT | B
+        piping = self._pipe_mask(scene)
+        if piping is not None:
+            return piping
         seeking = self._seek_mask(scene)
         if seeking is not None:
             return seeking
@@ -675,6 +721,11 @@ class Player:
             self.outcome = "decision budget spent"
             return 0
         maneuver = self._enemy_maneuver(scene, meta)
+        if maneuver is None and meta["piranha_out_ahead"] and (
+                any(f["kind"] in ("pipe", "wall") and f["distance_tiles"] <= 3 for f in
+                    (scene["terrain_ahead"] if isinstance(scene["terrain_ahead"], list) else []))):
+            # Never jump onto a pipe while its plant is out: it dips back in every few seconds.
+            maneuver = ("wait", "wait for the piranha plant to hide", [LEFT if meta["vx"] > STOPPED else 0] * 3)
         if maneuver is not None:
             # Enemies on flat ground are handled by code, no API call: stop, let them walk
             # up, and jump straight up so they pass underneath. A jump over an enemy lands
@@ -701,7 +752,23 @@ class Player:
         # platform). Repeating full_jump into it is how he hangs; go left instead.
         blocked = [f for f in terrain_now if f["kind"] in ("wall", "pipe")
                    and f.get("first_step_tiles", f["height_tiles"]) > UNJUMPABLE and f["distance_tiles"] <= 2]
-        if blocked and decision.move != "run_left":
+        if blocked:
+            # A sideways pipe reads as a tall wall too, and the way through it is to walk
+            # in. Push into it once; a real wall does not give, and then it's left.
+            if self.pushed_at != meta["x"] // 32:
+                self.pushed_at = meta["x"] // 32
+                self.queue = [RIGHT] * 40
+                decision.move = "run_right"
+                decision.detail = {**decision.detail, "push_into_wall": True}
+                self._record(decision, scene, meta, "walk into it (a side pipe?)")
+                return self.queue.pop(0)
+            if meta["pipe_top"] and 0 < meta["pipe_top"]["height"] <= REACH_TILES:
+                # A dead end with a pipe beside it: the way on is down the pipe.
+                self.enter_pipe = (meta["pipe_top"], self.frame + 600)
+                decision.move = "enter_pipe"
+                decision.detail = {**decision.detail, "dead_end": True}
+                self._record(decision, scene, meta, "dead end: get onto the pipe and go down it")
+                return self._pipe_mask(scene) or 0
             decision.move = "run_left"
             decision.detail = {**decision.detail, "unjumpable_wall": True}
         if decision.move == "run_left":
@@ -777,21 +844,39 @@ class Player:
         foes = [e["distance_tiles"] for e in enemies
                 if e["direction"] == "ahead" and e["level"].startswith("same")
                 and e["type"] != "piranha plant"]          # plants sit in pipes: the policy's `wait`
+        behind = [e["distance_tiles"] for e in enemies
+                  if e["direction"] == "behind" and e["level"].startswith("same")
+                  and e["type"] != "piranha plant"]
+        vx = meta["vx"]
+        if behind and min(behind) <= 2.0 and not (foes and min(foes) <= 5.0):
+            # Something walking up from behind, nothing ahead: stop and let it pass under.
+            if abs(vx) > STOPPED:
+                return "wait", "brake, enemy behind", [LEFT if vx > 0 else RIGHT] * 2
+            if min(behind) <= STOMP_FAR:
+                return "stomp", "jump straight up, it passes underneath", [A] * STOMP_HOLD + [0] * 44
+            return "wait", "wait for the enemy behind", [0] * 3
         if not foes or min(foes) > 5.0:
             return None
         if any(f["kind"] in ("wall", "pipe") and f["distance_tiles"] <= 1 for f in terrain):
             return None                                   # against a wall: the policy's jump first
         if any(f["kind"] == "pit" and f["distance_tiles"] <= 2 for f in terrain):
+            # An enemy on the far side of a pit: the jump would land on it. It cannot
+            # cross the pit either, so hold here until it has wandered off.
+            if min(foes) <= STOMP_FAR and abs(meta["vx"]) <= STOPPED:
+                return "stomp", "jump straight up, it passes underneath", [A] * STOMP_HOLD + [0] * 44
+            if min(foes) <= 5.0:
+                return "wait", "wait for the enemy across the pit to move off", [LEFT if meta["vx"] > STOPPED else 0] * 3
             return None                                   # a pit this close: jumping is the policy's call
         foe = min(foes)
-        vx = meta["vx"]
-        behind = [e["distance_tiles"] for e in enemies
-                  if e["direction"] == "behind" and e["level"].startswith("same")]
-        clear_behind = not (behind and min(behind) < 3)
+        clear_behind = not (behind and min(behind) < 6)   # room to back away
         running = abs(vx) > WALK_SPEED
+        if meta["headroom_ahead"] < 2 and clear_behind:
+            # An overhang here or just ahead leaves no room to jump. The enemy is ahead, so
+            # the open ground is behind: stop, back out the way Mario came, meet it there.
+            if vx > STOPPED:
+                return "wait", "low ceiling ahead, brake", [LEFT] * 3
+            return "run_left", "low ceiling ahead, back out to open ground", [LEFT | B] * 3
         if meta["headroom"] < 2:
-            # Under an overhang no jump is possible at all: get out from under it first,
-            # at full speed, and decide again in the open.
             return "run_right", "low ceiling, run out from under it", [RIGHT | B] * 3
         if meta["headroom"] < 4 and running:
             # Not enough room for a full jump: a hop is all there is, so hop when close.
@@ -801,14 +886,16 @@ class Player:
         if running and foe <= 4.0:
             # No room to stop (a skid from a run slides two tiles): a running hop clears
             # a single enemy reliably, a running full jump a tall one or a pair.
-            pair = len(foes) >= 2 and sorted(foes)[1] <= 7
+            # A running hop lands ~4.7 tiles on, a full jump ~8: with a second enemy in
+            # the line, pick whichever lands in a gap rather than on it.
+            second = sorted(foes)[1] if len(foes) >= 2 else None
             tall = any(e["type"] in TALL_ENEMIES for e in enemies
                        if e["direction"] == "ahead" and e["level"].startswith("same"))
             if tall:
                 # A koopa is a tile and a half tall: the full jump has to start early.
                 return "full_jump", "running full jump over the koopa", move_to_masks("full_jump")
             if foe <= 2.99:
-                move = "full_jump" if pair else "hop"
+                move = "full_jump" if second is not None and second <= 5.5 else "hop"
                 return move, f"running {move.replace('_', ' ')} over it", move_to_masks(move)
             return "run_right", "keep running, hop when close", [RIGHT | B] * 3
         if abs(vx) > STOPPED:
@@ -816,9 +903,11 @@ class Player:
                 return "hop", "walking hop over it", move_to_masks("hop")
             return "wait", "brake for the enemy", [LEFT if vx > 0 else RIGHT] * 2
         if meta["ceiling"] and clear_behind:
+            # A block overhead bonks the jump short, and a short jump lands on the enemy:
+            # get clear of it first, quickly when the enemy is already close.
             if foe > 2.2:
                 return "back_up", "back out from under the block", [LEFT] * 4 + [0] * 2
-            return "stomp", "step back and jump straight up", [LEFT] * 6 + [A] * STOMP_HOLD + [0] * 44
+            return "run_left", "run out from under the block", [LEFT | B] * 3
         if foe <= STOMP_FAR or (behind and min(behind) <= STOMP_FAR):
             # Held still for the whole flight so Mario comes straight back down. An enemy
             # coming up from behind gets the same treatment.
