@@ -1,3 +1,4 @@
+import { EMPTY_AGENT_RUN } from "../emulator/EmulatorProvider";
 // web/src/components/DisassemblyPanel.test.tsx
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -37,6 +38,7 @@ function makeCtx(pc: number, breakpoints: number[]): EmulatorContextValue {
     framebuffer: null,
     movie: { playing: false, frame: 0, total: 0 },
     liveAgent: { connected: false, frame: 0 },
+    agentRun: EMPTY_AGENT_RUN,
     dbg: null,
     actions: { toggleBreakpoint } as unknown as EmulatorContextValue["actions"],
   };

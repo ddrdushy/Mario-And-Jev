@@ -145,6 +145,44 @@ model = PPO("MlpPolicy", env, verbose=1)
 model.learn(total_timesteps=1_000_000)
 ```
 
+## 7. Let TypeSafe's Jev play
+
+`nesenv/jev.py` plays SMB with [TypeSafe](https://docs.typesafe.ai)'s Jev model making the
+decisions. Jev reads text, not pixels, so `nesenv/smb_state.py` first turns RAM into a
+small semantic scene ("pipe 2 tiles high, close ahead; goomba very close ahead, same
+height"). A few times a second that scene goes to Jev with one `Choice` question (which
+move: run, hop, full jump, wait, back up) and two speculative `Noul` questions that are
+only read when the Choice comes back with low confidence. Code turns the move into held
+buttons. The questions and thresholds are constants at the top of `jev.py`.
+
+```bash
+cd python
+echo 'TYPESAFE_API_KEY=...' > ../.env     # from console.typesafe.ai/keys; .env is gitignored
+
+PYTHONPATH=. python3 examples/jev_agent.py "Super Mario Bros.nes" jev.nesmovie
+PYTHONPATH=. python3 -m nesenv.live "Super Mario Bros.nes" --agent jev     # then Spawn Agent
+```
+
+With `VITE_LIVE_AGENT_URL=http://localhost:8000/stream pnpm --dir web dev`, **Spawn Agent**
+switches NES Studio to an agent view: a large screen, the current decision (the scene text
+that was sent, the move, its probabilities and confidence, a decision log) and a latency
+panel (median / p95 round trip, tokens, estimated cost, a per-call latency chart).
+
+The agent plays a whole game: through the flagpole into the next level and through
+deaths into the next life, until game over. It also collects: `smb_state.py` lists the
+coins, ? blocks and coin bricks in view, Jev picks which one to go for (a `Choice` over the
+listed items, plus a `Noul` asking whether a danger comes first), and code does the jump
+geometry (positioning under a block, walking-jump launch points, climbing onto a ledge for
+a high block; measured constants at the top of the collecting section in `jev.py`). A few
+invariants stay in code regardless of what Jev says: no collecting with an enemy at Mario's
+height in view or a pit within two tiles, no jump until its reason is within 2.5 tiles, a
+full jump instead of a hop for two enemies in a row.
+
+The run prints calls, tokens, cost and latency, and writes a `.jsonl` decision log next to
+the movie. `--policy heuristic` (or `--agent heuristic`) runs the same harness with an
+offline rule-based policy, so you can test without a key. The emulator only advances when
+stepped, so API latency never costs Mario a frame; it only slows the live stream.
+
 ## Tests
 
 ```bash

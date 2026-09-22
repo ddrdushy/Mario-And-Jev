@@ -1,3 +1,4 @@
+import { EMPTY_AGENT_RUN } from "../emulator/EmulatorProvider";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -6,7 +7,8 @@ import { Toolbar } from "./Toolbar";
 
 const mockContext = vi.hoisted(() => ({ value: null as EmulatorContextValue | null }));
 
-vi.mock("../emulator/EmulatorProvider", () => ({
+vi.mock("../emulator/EmulatorProvider", async (orig) => ({
+  ...(await orig<typeof import("../emulator/EmulatorProvider")>()),
   useEmulator: () => mockContext.value,
 }));
 
@@ -49,6 +51,7 @@ function makeContext(
     framebuffer: null,
     movie: { playing: false, frame: 0, total: 0 },
     liveAgent: { connected: false, frame: 0 },
+    agentRun: EMPTY_AGENT_RUN,
     dbg: null,
     actions,
     ...overrides,

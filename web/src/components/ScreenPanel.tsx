@@ -52,7 +52,7 @@ export function ScreenPanel({
           width={SCREEN_WIDTH}
           height={SCREEN_HEIGHT}
           style={{ imageRendering: "pixelated" }}
-          className="absolute inset-0 h-full w-full"
+          className="absolute inset-0 h-full w-full object-contain"
         />
         {/* CRT scanline overlay */}
         <div

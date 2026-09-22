@@ -1,3 +1,4 @@
+import { EMPTY_AGENT_RUN } from "../emulator/EmulatorProvider";
 // web/src/components/LoadCodeModal.test.tsx
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -28,6 +29,7 @@ function makeCtx(overrides: Partial<EmulatorContextValue> = {}): EmulatorContext
     framebuffer: null,
     movie: { playing: false, frame: 0, total: 0 },
     liveAgent: { connected: false, frame: 0 },
+    agentRun: EMPTY_AGENT_RUN,
     dbg: null,
     actions: { loadOpcodes } as unknown as EmulatorContextValue["actions"],
     ...overrides,

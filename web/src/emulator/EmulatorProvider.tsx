@@ -53,6 +53,85 @@ export interface EmulatorActions {
   disconnectLiveAgent(): void;
 }
 
+/** One decision streamed by a narrating live agent (see python/nesenv/live.py). */
+export interface AgentDecision {
+  n: number;
+  frame: number;
+  x: number;
+  summary: string;
+  move: string;
+  confidence: number;
+  source: string; // "jev" | "jev-fallback" | "jev-cached" | "code" | "heuristic"
+  latency_ms: number;
+  /** The part of latency_ms the model itself took; the rest is network. */
+  server_ms?: number;
+  input_tokens: number;
+  probabilities?: Record<string, number>;
+  obstacle_needs_jump?: number;
+  enemy_needs_jump?: number;
+  /** What the harness actually did: the move, or "collect <item>" for a chosen target. */
+  action?: string;
+  target?: string;
+  target_probabilities?: Record<string, number>;
+  target_confidence?: number;
+  hazard_first?: number;
+  world?: number;
+  stage?: number;
+  coins?: number;
+  lives?: number;
+}
+
+export interface LifeOutcome {
+  outcome: string;
+  distance: number;
+  world?: number;
+  stage?: number;
+  coins?: number;
+}
+
+export interface AgentRun {
+  policy: string | null;
+  model: string | null;
+  moves: string[];
+  pricePerMtok: number;
+  /** Most recent decisions, oldest first (capped at AGENT_HISTORY). */
+  decisions: AgentDecision[];
+  /** Decisions that cost an API round trip (the rest were cached or decided in code). */
+  calls: number;
+  /** Every decision, including the free ones. */
+  decided: number;
+  fallbacks: number;
+  inputTokens: number;
+  latencySumMs: number;
+  lives: number;
+  lastOutcome: LifeOutcome | null;
+  /** Every life / level outcome so far, oldest first. */
+  outcomes: LifeOutcome[];
+}
+
+export const AGENT_HISTORY = 120;
+
+/** True when this decision was a real policy call, not a cache hit or a code shortcut. */
+export function isModelCall(d: AgentDecision): boolean {
+  return d.source !== "jev-cached" && d.source !== "code";
+}
+
+export const EMPTY_AGENT_RUN: AgentRun = {
+  policy: null,
+  model: null,
+  moves: [],
+  pricePerMtok: 0,
+  decisions: [],
+  calls: 0,
+  decided: 0,
+  fallbacks: 0,
+  inputTokens: 0,
+  latencySumMs: 0,
+  lives: 0,
+  lastOutcome: null,
+  outcomes: [],
+};
+
 export interface EmulatorContextValue {
   status: EmulatorStatus;
   snapshot: EmulatorSnapshot | null;
@@ -61,6 +140,7 @@ export interface EmulatorContextValue {
   framebuffer: Uint8ClampedArray | null;
   movie: { playing: boolean; frame: number; total: number };
   liveAgent: { connected: boolean; frame: number };
+  agentRun: AgentRun;
   dbg: Debugger | null;
   actions: EmulatorActions;
 }
@@ -84,6 +164,7 @@ export function EmulatorProvider(props: {
   const [movie, setMovie] = useState({ playing: false, frame: 0, total: 0 });
   const movieRafRef = useRef<number | null>(null);
   const [liveAgent, setLiveAgent] = useState({ connected: false, frame: 0 });
+  const [agentRun, setAgentRun] = useState<AgentRun>(EMPTY_AGENT_RUN);
   const liveSourceRef = useRef<EventSource | null>(null);
   const liveRomRef = useRef<Uint8Array | null>(null);
   // Mirror the breakpoints state in a ref so toggleBreakpoint can read the
@@ -324,6 +405,41 @@ export function EmulatorProvider(props: {
       let frames = 0;
       const es = new EventSource(url);
       liveSourceRef.current = es;
+      setAgentRun(EMPTY_AGENT_RUN);
+
+      // Narration from the jev / heuristic agents: who is playing, each decision
+      // with its latency, and how each life ended. Other agents never send these.
+      es.addEventListener("agent", (ev) => {
+        const info = JSON.parse((ev as MessageEvent).data);
+        setAgentRun((run) => ({
+          ...run,
+          policy: info.policy,
+          model: info.model,
+          moves: info.moves ?? [],
+          pricePerMtok: info.price_per_mtok ?? 0,
+          lives: run.lives + 1,
+        }));
+      });
+      es.addEventListener("decision", (ev) => {
+        const d = JSON.parse((ev as MessageEvent).data) as AgentDecision;
+        setAgentRun((run) => ({
+          ...run,
+          decisions: [...run.decisions, d].slice(-AGENT_HISTORY),
+          calls: run.calls + (isModelCall(d) ? 1 : 0),
+          decided: run.decided + 1,
+          fallbacks: run.fallbacks + (d.source === "jev-fallback" ? 1 : 0),
+          inputTokens: run.inputTokens + d.input_tokens,
+          latencySumMs: run.latencySumMs + (isModelCall(d) ? d.latency_ms : 0),
+        }));
+      });
+      es.addEventListener("outcome", (ev) => {
+        const o = JSON.parse((ev as MessageEvent).data);
+        setAgentRun((run) => ({
+          ...run,
+          lastOutcome: o,
+          outcomes: [...run.outcomes, o].slice(-50),
+        }));
+      });
 
       es.addEventListener("rom", (ev) => {
         const rom = base64ToBytes((ev as MessageEvent).data);
@@ -509,10 +625,11 @@ export function EmulatorProvider(props: {
       framebuffer,
       movie,
       liveAgent,
+      agentRun,
       dbg,
       actions,
     }),
-    [status, snapshot, breakpoints, running, framebuffer, movie, liveAgent, dbg, actions],
+    [status, snapshot, breakpoints, running, framebuffer, movie, liveAgent, agentRun, dbg, actions],
   );
 
   return (

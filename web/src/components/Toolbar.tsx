@@ -51,7 +51,10 @@ export function Toolbar({
   onHelp,
   onLoadCode,
 }: ToolbarProps): JSX.Element {
-  const { snapshot, running, actions } = useEmulator();
+  const { snapshot, running, liveAgent, actions } = useEmulator();
+  // The live agent needs a local backend (python -m nesenv.live), so the button is
+  // opt-in: it only appears when VITE_LIVE_AGENT_URL points at one.
+  const showSpawnAgent = Boolean(import.meta.env.VITE_LIVE_AGENT_URL);
   const { addToast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const gamesMenuRef = useRef<HTMLDivElement>(null);
@@ -311,6 +314,27 @@ export function Toolbar({
         >
           Load Code
         </button>
+        {showSpawnAgent ? (
+          <button
+            type="button"
+            data-testid="spawn-agent"
+            onClick={() =>
+              liveAgent.connected
+                ? actions.disconnectLiveAgent()
+                : actions.connectLiveAgent()
+            }
+            aria-label="Spawn Agent"
+            title="Watch a live agent (python -m nesenv.live)"
+            className={[
+              "press rounded-md border px-[9px] py-[4px] text-[10px]",
+              liveAgent.connected
+                ? "border-[var(--grn)] bg-[var(--grn)]/20 text-[var(--tx)]"
+                : "border-[var(--bd-strong)] bg-[var(--b2)] text-[var(--tx)] hover:bg-[var(--b3)]",
+            ].join(" ")}
+          >
+            {liveAgent.connected ? "Live Agent" : "Spawn Agent"}
+          </button>
+        ) : null}
 
         <ThemeToggle />
         <button

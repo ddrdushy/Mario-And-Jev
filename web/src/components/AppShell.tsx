@@ -10,13 +10,18 @@ import { CpuStatePanel } from "./CpuStatePanel";
 import { DisassemblyPanel } from "./DisassemblyPanel";
 import { BreakpointsPanel } from "./BreakpointsPanel";
 import { MemoryPanel } from "./MemoryPanel";
+import { AgentDecisionPanel, AgentLatencyPanel } from "./AgentPanels";
 import { HelpModal } from "./HelpModal";
 import { LoadCodeModal } from "./LoadCodeModal";
 import { Toaster } from "./toast/Toaster";
 import { Button } from "./ui/Button";
 
 export function AppShell(): JSX.Element {
-  const { status, framebuffer, dbg, actions, running } = useEmulator();
+  const { status, framebuffer, dbg, actions, running, liveAgent, agentRun } =
+    useEmulator();
+  // While a narrating agent plays, the debugger panels are noise: show a big
+  // screen beside what the agent decided and how long each decision took.
+  const agentView = Boolean(liveAgent?.connected || agentRun?.policy);
   const [helpOpen, setHelpOpen] = useState(false);
   const [loadCodeOpen, setLoadCodeOpen] = useState(false);
   const [ppuOpen, setPpuOpen] = useState(false);
@@ -75,6 +80,20 @@ export function AppShell(): JSX.Element {
         data-testid="cockpit"
         className="flex min-h-0 flex-1 flex-col gap-[12px] p-[12px]"
       >
+        {agentView ? (
+          <div
+            data-testid="agent-grid"
+            className="grid min-h-0 flex-1 gap-[12px]"
+            style={{ gridTemplateColumns: "minmax(0, 1.55fr) minmax(0, 1fr)" }}
+          >
+            <ScreenPanel framebuffer={framebuffer} revealDelay={0} className="min-h-0" />
+            <div className="flex min-h-0 min-w-0 flex-col gap-[12px]">
+              <AgentDecisionPanel revealDelay={50} className="min-h-0 flex-1" />
+              <AgentLatencyPanel revealDelay={100} className="min-h-0 flex-none" />
+            </div>
+          </div>
+        ) : (
+        <>
         {/* CPU readout strip — full width, fixed band */}
         <CpuStatePanel revealDelay={0} className="h-[118px] flex-none" />
 
@@ -129,6 +148,8 @@ export function AppShell(): JSX.Element {
           {/* right: Memory (full height, fills rows) */}
           <MemoryPanel revealDelay={200} className="min-h-0" />
         </div>
+        </>
+        )}
       </main>
 
       {play ? (

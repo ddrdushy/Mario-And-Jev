@@ -30,6 +30,7 @@
   --acc2: #aab0f8;
   --grn: #46b98a;
   --amb: #d9a23d;
+  --chart-2: #bd8527; /* second chart series; validated against --acc on --b1 */
   --red: #e0564b;
 
   /* the page background a legend label paints over to mask the border */
@@ -95,6 +96,7 @@
   --acc2: #5b62ec;
   --grn: #128a57;
   --amb: #b06c10;
+  --chart-2: #b06c10;
   --red: #ce372c;
 
   --legend-bg: var(--b0);

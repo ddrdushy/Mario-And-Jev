@@ -1,3 +1,4 @@
+import { EMPTY_AGENT_RUN } from "../emulator/EmulatorProvider";
 // web/src/components/StackPanel.test.tsx
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
@@ -38,6 +39,7 @@ describe("StackPanel", () => {
       framebuffer: null,
       movie: { playing: false, frame: 0, total: 0 },
       liveAgent: { connected: false, frame: 0 },
+      agentRun: EMPTY_AGENT_RUN,
       dbg: makeDbg(),
       actions: {} as EmulatorContextValue["actions"],
     };
@@ -54,6 +56,7 @@ describe("StackPanel", () => {
       framebuffer: null,
       movie: { playing: false, frame: 0, total: 0 },
       liveAgent: { connected: false, frame: 0 },
+      agentRun: EMPTY_AGENT_RUN,
       dbg: makeDbg(),
       actions: {} as EmulatorContextValue["actions"],
     };
@@ -74,6 +77,7 @@ describe("StackPanel", () => {
       framebuffer: null,
       movie: { playing: false, frame: 0, total: 0 },
       liveAgent: { connected: false, frame: 0 },
+      agentRun: EMPTY_AGENT_RUN,
       dbg: null,
       actions: {} as EmulatorContextValue["actions"],
     };

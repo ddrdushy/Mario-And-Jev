@@ -42,3 +42,6 @@ python/dist/
 
 # Runtime logs (e.g. mprocs)
 *.log
+
+# Live-agent decision logs (python -m nesenv.live)
+logs/

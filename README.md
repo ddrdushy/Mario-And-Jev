@@ -119,6 +119,23 @@ This is a local dev and research feature: it needs the Python server on your own
 machine, so the **Spawn Agent** button is hidden in production builds. If you host a
 backend yourself, set `VITE_LIVE_AGENT_URL` to its stream URL to show the button.
 
+## Mario and Jev
+
+This fork adds an agent that plays Super Mario Bros with [TypeSafe](https://docs.typesafe.ai)'s
+Jev model making the decisions. Jev reads text, not pixels, so `python/nesenv/smb_state.py`
+turns RAM into a short scene description; `python/nesenv/jev.py` asks Jev which move to make
+and which coin or block to go for, and does the jump geometry, enemy handling and
+level-to-level play in code. NES Studio gets an agent view (large screen, the current
+decision with its probabilities and latency, a per-call latency chart) behind an opt-in
+**Spawn Agent** button. See [`python/README.md`](python/README.md#7-let-typesafes-jev-play).
+
+```bash
+cmake -B native_build -DCMAKE_BUILD_TYPE=Release && cmake --build native_build --target nesenv
+echo 'TYPESAFE_API_KEY=...' > .env
+PYTHONPATH=python python3 -m nesenv.live "Super Mario Bros.nes" --agent jev --port 8000
+VITE_LIVE_AGENT_URL=http://localhost:8000/stream pnpm --dir web dev   # then Spawn Agent
+```
+
 ## Running it
 
 Easiest path is Docker:
