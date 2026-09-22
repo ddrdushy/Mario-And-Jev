@@ -112,7 +112,7 @@ export function AgentDecisionPanel({ revealDelay, className }: PanelProps): JSX.
       }
       revealDelay={revealDelay}
       className={className}
-      bodyClassName="flex min-h-0 flex-col gap-[10px]"
+      bodyClassName="nes-scroll flex min-h-0 flex-col gap-[10px] overflow-auto"
     >
       {!current ? (
         <p className="font-mono text-[10px] text-[var(--tx-dim)]">
@@ -231,7 +231,7 @@ export function AgentDecisionPanel({ revealDelay, className }: PanelProps): JSX.
             </div>
           ) : null}
 
-          <div className="nes-scroll min-h-0 flex-1 overflow-auto">
+          <div className="min-h-[120px] flex-none">
             <table className="w-full border-collapse font-mono text-[10px]">
               <thead className="sticky top-0 bg-[var(--b1)] text-left text-[var(--dim)]">
                 <tr>

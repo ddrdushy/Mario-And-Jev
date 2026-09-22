@@ -40,7 +40,7 @@ from .smb import OPER_MODE, PLAYER_PAGE, PLAYER_X
 # Module-level config set by main(); each connection reads it.
 ROM = b""
 AGENT = "scripted"
-LOG_DIR = Path("logs")   # one .jsonl per game for the jev / heuristic agents
+LOG_DIR = Path(__file__).resolve().parents[2] / "logs"   # <repo>/logs, one .jsonl per game
 
 
 def gameplay_started(nes: Nes, frame: int) -> bool:

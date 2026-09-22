@@ -1,195 +1,159 @@
-# NES Emulator + 6502 Studio
+# Mario and Jev
 
-This is an NES emulator I wrote in C++, compiled to WebAssembly, with a browser
-debugger on top called **NES Studio**. You can single-step a real 6502, poke at
-memory while it runs, watch the PPU draw, and (the fun part) actually play games in
-the same window. Super Mario Bros. boots straight into a playable 1-1.
+Super Mario Bros, played by [TypeSafe](https://docs.typesafe.ai)'s **Jev** model, live in
+your browser.
 
-The CPU is the part I'm most happy with. It passes `nestest` and blargg's
-`instr_test` suites, and matches the `nestest` golden log cycle for cycle.
+Jev is not a chat model. You send it a *state* and typed *questions* (a Choice, a Score,
+a yes/no "Noul") and it returns probabilities, in about 100 ms, for a fraction of a cent.
+This project puts that in front of a real NES: the emulator reads the game's RAM, code
+turns it into a short description of the scene, Jev decides what Mario should do, code
+turns the decision into buttons, and NES Studio shows the decision, its probabilities and
+how long it took while Mario plays.
 
-![NES Studio screenshot](imgs/main-screenshot.png)
+![Jev playing 1-1 in NES Studio, with the decision and latency panels](imgs/jev-agent.png)
 
-## What's in it
+## How a decision is made
 
-The 6502 core does all 151 official opcodes plus the documented "illegal" ones. Real
-games use them, so you don't get far without them. The PPU handles backgrounds,
-sprites, OAM and `$4014` DMA, 8x8 and 8x16 sprites, sprite-0 hit, scrolling, and all
-four mirroring modes. There's an APU (two pulse channels, triangle, noise) wired to
-WebAudio, and five mappers: NROM, MMC1, UxROM, CNROM, and MMC3 with its scanline IRQ.
-
-On top of the core, NES Studio gives you the usual debugger stuff: step, run,
-breakpoints, live disassembly, a memory editor, CPU and PPU state, pattern, nametable
-and OAM viewers, and a full-screen Play mode.
-
-It's covered by 32 native (gtest) and 211 web (Vitest) tests, and the conformance
-suite below runs the real NES test ROMs in CI.
-
-## Conformance
-
-Unit tests are great for catching "I broke ADC" but useless for the subtle timing
-bugs that actually break games. For those I lean on the test ROMs everyone in the
-emulator world uses. The harness in
-[`tests/conformance_test.cpp`](tests/conformance_test.cpp) runs them through the real
-core and reads back each ROM's own pass/fail report. The ROMs aren't committed; a
-script grabs them on demand.
-
-Here's where things stand:
-
-| Test ROM | Author | What it checks | Status |
-|----------|--------|----------------|:------:|
-| `nestest` | kevtris | Every official + illegal CPU opcode | pass |
-| `instr_test` 01-basics | blargg | Basic instructions | pass |
-| `instr_test` 02-implied | blargg | Implied + unofficial opcodes | pass |
-| `instr_test` official_only (16 ROMs) | blargg | All official instructions | pass |
-| `instr_timing` | blargg | Instruction cycle timing | pass |
-| `ppu_vbl_nmi` | blargg | PPU VBlank/NMI dot timing | not yet |
-
-That last one fails on purpose, and I left it in the scoreboard rather than hiding
-it. The PPU renders a whole scanline at a time instead of dot by dot. That's plenty
-accurate for real games and sprite-0 splits, but not for the cycle-exact PPU timing
-ROMs. Going dot-based is the next big accuracy job; there's more on the why in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). If a ROM is missing the harness skips
-it instead of failing, so a fresh clone stays green.
-
-```bash
-./tests/roms/fetch_test_roms.sh          # grab the ROMs (once)
-cd native_build && ctest -R conformance  # run the scoreboard
+```
+NES RAM ──► smb_state.py ──► scene (JSON) ──► Jev ──► answers ──► jev.py ──► buttons
+            tile buffer,      "pipe 2 tiles      Choice: move        probabilities,    run, hop,
+            enemy slots,       high, close       Choice: target      confidence        full jump,
+            player state       ahead; goomba     Noul: danger                          stomp, seek
+                               very close"        first?                               under a block
 ```
 
-## Playing games
+A few times a second, while Mario is on the ground, one request goes to Jev with the
+scene and three or four questions:
 
-| Game | Mapper | How far it gets |
-|------|:------:|-----------------|
-| Super Mario Bros. | NROM (0) | Fully playable 1-1: walk, jump, scroll, status-bar split |
-| Super Mario Bros. 3 | MMC3 (4) | Boots, attract demo plays (scanline IRQ split) |
+| Question | Type | What it decides |
+|---|---|---|
+| `move` | Choice | `run_right`, `hop`, `full_jump`, `stomp`, `wait`, `back_up` |
+| `target` | Choice | which of the coins / ? blocks / coin bricks in view to go for, or `none` |
+| `hazard_first` | Noul | must a danger be dealt with before stopping to collect? |
+| `obstacle_needs_jump`, `enemy_needs_jump` | Noul | read only when `move` comes back with low confidence |
 
-Hit **Load ROM**, pick a `.nes` file, then **Play** for full-screen. Controls: arrows
-for the D-pad, **X** is A (jump), **Z** is B, **Enter** is Start, **Shift** is Select.
+The split follows TypeSafe's own advice: Jev is asked for *judgements*, everything
+numeric stays in code. Jev is weak at arithmetic and reads instructions literally, so:
 
-## Headless library and watching an agent play
+- **Scene text is bucketed words**, not numbers: "very close (1 tile)", "same height as
+  Mario", "a ? block with a coin inside, 4 tiles above the ground".
+- **Jump geometry is code.** A measured jump table (A held 16 frames from a standstill
+  = 3.4 tiles), frame-by-frame positioning under a block, climbing onto a ledge for a
+  block that is too high, launch points for floating coins.
+- **Enemies at Mario's height are code too** (`Player._enemy_maneuver`): brake, wait,
+  jump straight up when the enemy is 1.3 tiles away so it passes underneath (measured),
+  a running hop when there is no room to brake, a full jump for koopas and pairs, and a
+  headroom check because World 1-2 has overhangs where no jump is possible.
+- **Invariants stay in code** whatever Jev says: no collecting with a pit two tiles
+  ahead or an enemy in view, no jump until its reason is within reach, hold still
+  through a block jump.
+- **No call when none is needed**: an empty scene is `run_right`, and a scene identical
+  to one already answered reuses the answer.
 
-The same core also builds as a small C-ABI shared library (`libnesenv`) so you can drive
-an NES from outside the browser, for example to script or train an agent. One handle is
-one independent machine, handles share no state, and stepping is deterministic, so the
-same inputs always produce the same frames.
+The agent plays whole games: through the flagpole into the next level, through a death
+into the next life, until game over. Every decision is logged (`logs/*.jsonl`) with the
+scene, the answer, the probabilities and the latency.
 
-```c
-NesEnv* e = nes_create();
-nes_load(e, rom, rom_len);
-nes_step(e, RIGHT | A);                    // advance one frame with buttons held
-const uint8_t* rgb = nes_framebuffer(e);   // 256x240 RGBA
-```
+## Setup
 
-Because stepping is deterministic, a whole play session is captured by the ROM plus one
-controller byte per frame. Record a scripted agent into a self-contained `.nesmovie`,
-either with the C++ tool or the Python one (they produce byte-identical output):
-
-```bash
-cmake --build native_build --target record_demo
-./native_build/record_demo "Super Mario Bros.nes" smb.nesmovie
-# or:  cd python && PYTHONPATH=. python3 examples/record_scripted.py "Super Mario Bros.nes" smb.nesmovie
-```
-
-Load that file with **Watch Movie** in NES Studio and the browser replays it frame for
-frame. The WASM core and the native core are the same code, so they stay in lockstep,
-which is how you watch an agent play in the browser with no backend at all.
-
-On top of the ABI there is a Python package with a Gymnasium-style Super Mario Bros
-environment (observation, action set, reward) and an optional Gymnasium adapter for
-stable-baselines3. See [`python/README.md`](python/README.md) for generating movies,
-the env API, and training; the design notes are in
-[`docs/rl-env-spec.md`](docs/rl-env-spec.md).
-
-You can also watch an agent live. Start the streaming server and click **Spawn Agent**
-in NES Studio; the browser re-simulates the streamed actions in real time:
+You need a C++17 compiler and CMake for the core, Python 3.10+, Node 20+ with pnpm for
+the web app, a Super Mario Bros ROM (not included) and a TypeSafe API key from
+[console.typesafe.ai](https://console.typesafe.ai/keys).
 
 ```bash
-PYTHONPATH=python python3 -m nesenv.live "Super Mario Bros.nes" --port 8000
-```
+# 1. the headless core the Python package drives
+cmake -B native_build -DCMAKE_BUILD_TYPE=Release
+cmake --build native_build --target nesenv
 
-To run the web app and the agent server together, there is an [`mprocs.yaml`](mprocs.yaml):
-
-```bash
-brew install mprocs            # once
-NES_ROM="Super Mario Bros.nes" mprocs
-```
-
-This is a local dev and research feature: it needs the Python server on your own
-machine, so the **Spawn Agent** button is hidden in production builds. If you host a
-backend yourself, set `VITE_LIVE_AGENT_URL` to its stream URL to show the button.
-
-## Mario and Jev
-
-This fork adds an agent that plays Super Mario Bros with [TypeSafe](https://docs.typesafe.ai)'s
-Jev model making the decisions. Jev reads text, not pixels, so `python/nesenv/smb_state.py`
-turns RAM into a short scene description; `python/nesenv/jev.py` asks Jev which move to make
-and which coin or block to go for, and does the jump geometry, enemy handling and
-level-to-level play in code. NES Studio gets an agent view (large screen, the current
-decision with its probabilities and latency, a per-call latency chart) behind an opt-in
-**Spawn Agent** button. See [`python/README.md`](python/README.md#7-let-typesafes-jev-play).
-
-```bash
-cmake -B native_build -DCMAKE_BUILD_TYPE=Release && cmake --build native_build --target nesenv
+# 2. the API key (.env is gitignored)
 echo 'TYPESAFE_API_KEY=...' > .env
+
+# 3. the web app; the WASM core it needs is built with Docker (see docs/EMULATOR.md)
+docker compose run --rm dev build_wasm.sh
+cd web && pnpm install && cd ..
+```
+
+The ROM can be plain *Super Mario Bros* or the *SMB / Duck Hunt / Track Meet* multicart;
+the agent taps Start through either menu.
+
+## Run it
+
+**Watch Jev play, live:**
+
+```bash
 PYTHONPATH=python python3 -m nesenv.live "Super Mario Bros.nes" --agent jev --port 8000
-VITE_LIVE_AGENT_URL=http://localhost:8000/stream pnpm --dir web dev   # then Spawn Agent
+VITE_LIVE_AGENT_URL=http://localhost:8000/stream pnpm --dir web dev
 ```
 
-## Running it
+Open the dev server and click **Spawn Agent**. The debugger panels give way to an agent
+view: a large screen, the current decision (the scene text that was sent, the move, the
+move and target probabilities, confidence, a decision log) and a latency panel (median
+and p95 round trip split into Jev's own time and network time, tokens, estimated cost, a
+per-call latency chart, and how each life ended). Click the button again to disconnect;
+every open tab runs its own agent and its own API calls.
 
-Easiest path is Docker:
+**Record a game to a movie** (replayable in NES Studio, with a `.jsonl` decision log):
 
 ```bash
-git clone https://github.com/MaxwellKnight/nes-emulator.git
-cd nes-emulator
-
-docker compose --profile dev up web-dev    # dev server on http://localhost:5173
-docker compose run --rm dev build_wasm.sh  # build the WASM core into web/src/wasm/generated/
-docker compose run --rm test               # native build + gtest suite
+cd python
+PYTHONPATH=. python3 examples/jev_agent.py "Super Mario Bros.nes" jev.nesmovie
 ```
 
-### Just the front-end
-
-The web app is in `web/` (pnpm, Node 20+):
+**No key yet?** The same harness runs with an offline rule-based policy, useful for
+testing the code side:
 
 ```bash
-cd web
-pnpm install
-pnpm dev         # Vite dev server
-pnpm test        # Vitest
-pnpm typecheck   # tsc --noEmit
-pnpm build       # production bundle in web/dist
+PYTHONPATH=python python3 -m nesenv.live "Super Mario Bros.nes" --agent heuristic
+PYTHONPATH=. python3 examples/jev_agent.py "Super Mario Bros.nes" out.nesmovie --policy heuristic
 ```
 
-Heads up: the compiled `cpu_wasm.js` and `cpu_wasm.wasm` land in
-`web/src/wasm/generated/` and are gitignored, so build the WASM target first or the
-front-end won't have a real core to talk to.
+The emulator only advances when it is stepped, so API latency never costs Mario a frame;
+it only slows the live stream down.
 
-### Native build + tests, no Docker
+## What it does today
 
-You'll need a C++17 compiler, CMake 3.14+, and GoogleTest.
+Numbers from `jev-1.13.0`, September 2026, on this machine:
 
-```bash
-cmake -B native_build -DCMAKE_BUILD_TYPE=Debug
-cmake --build native_build -j
-./tests/roms/fetch_test_roms.sh      # optional, turns on the conformance suite
-cd native_build && ctest --output-on-failure
+- Round trip to Jev is typically 330-400 ms, of which Jev itself is 70-120 ms; the rest
+  is network from here. Occasional 2-6 s spikes come from outside Jev.
+- About 1,400 input tokens per call; a whole game (three lives) costs $0.01-0.02.
+- Jev clears World 1-1 most games, usually with 5-15 coins, and gets a fair way into
+  1-2 before running out of lives. It does not yet collect every coin: with an enemy
+  in view collecting is skipped, and pipe bonus rooms are not entered.
+
+The decision log is the place to look when Mario dies. Each line has the scene Jev saw,
+what it answered, what the code actually did and why (`action`, `enemy_maneuver`,
+`early_jump_held`, `hop_upgraded`), so a death traces back to a wording in the
+questions or a rule in the code.
+
+## Tuning it
+
+Everything Jev is told lives at the top of [`python/nesenv/jev.py`](python/nesenv/jev.py):
+`MOVE_CRITERIA`, `BASE_QUESTIONS`, `TARGET_QUESTION`, the confidence thresholds and the
+measured jump constants. The scene vocabulary is in
+[`python/nesenv/smb_state.py`](python/nesenv/smb_state.py). Change a description, rerun,
+diff the logs.
+
+Two habits that paid off: name the exact condition in the criteria (Jev answers the
+question you wrote, not the one you meant; "a ledge that drops is not a pit" had to be
+said), and when a wrong answer is really a geometry problem, move it into code rather
+than into the prompt.
+
+## Layout
+
+```
+python/nesenv/smb_state.py   RAM -> scene description
+python/nesenv/jev.py         questions, Jev client, collect planner, enemy maneuver, Player
+python/nesenv/live.py        SSE server: frames + agent/decision/outcome events, logs/
+python/examples/jev_agent.py record a game
+web/src/components/AgentPanels.tsx   decision and latency panels
+web/src/emulator/EmulatorProvider.tsx  live-agent stream handling
+docs/EMULATOR.md             the emulator itself (upstream README)
 ```
 
-## How it's built
+## Credits and license
 
-The short version: a `Bus` wires together the `CPU`, `PPU`, `APU`, and the
-cartridge/mapper, and steps them at the NES's 1 CPU to 3 PPU ratio. That core
-compiles once and gets linked into both the native test binaries and a WASM module,
-which a typed TypeScript bridge (`web/src/wasm/`) wraps for the React app. The UI is
-Vite + React 18 + TypeScript + Tailwind, with the emulator state living in a context
-provider.
-
-The longer version, including the timing model, the trade-offs I made, and a war
-story about a one-dot bug that froze Mario, is in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
-## License
-
-GPL v3. See [LICENSE](LICENSE).
+Built on Maxwell Knight's [nes-emulator](https://github.com/MaxwellKnight/nes-emulator):
+the C++ core, NES Studio and the `nesenv` Python package are his; see
+[`docs/EMULATOR.md`](docs/EMULATOR.md). Jev is [TypeSafe](https://typesafe.ai)'s model.
+GPL v3, see [LICENSE](LICENSE).

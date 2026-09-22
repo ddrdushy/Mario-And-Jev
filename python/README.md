@@ -179,7 +179,7 @@ height in view or a pit within two tiles, no jump until its reason is within 2.5
 full jump instead of a hop for two enemies in a row.
 
 The run prints calls, tokens, cost and latency, and writes a `.jsonl` decision log next to
-the movie. `--policy heuristic` (or `--agent heuristic`) runs the same harness with an
+the movie; the live server writes one per game under `logs/` at the repo root. `--policy heuristic` (or `--agent heuristic`) runs the same harness with an
 offline rule-based policy, so you can test without a key. The emulator only advances when
 stepped, so API latency never costs Mario a frame; it only slows the live stream.
 
