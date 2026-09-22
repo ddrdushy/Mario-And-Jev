@@ -144,11 +144,17 @@ def _terrain(ram: bytes, mario_x: int, feet_row: int, body_rows: int) -> tuple[l
             "distance_tiles": i,
             "width_tiles": 1,
             "height_tiles": col["height"],
+            "_near_height": col["height"],   # the first column's own height: a staircase starts low
             "_end": i,
         })
     words = []
     for f in features:
         del f["_end"]
+        near = f.pop("_near_height")
+        if f["kind"] in ("wall", "pipe"):
+            f["first_step_tiles"] = near
+            if near < f["height_tiles"]:
+                f["shape"] = "rises like a staircase"
         if f["kind"] == "pit":
             f.pop("height_tiles")
             words.append(f"pit {f['width_tiles']} tiles wide, {f['distance']} ahead")
@@ -214,8 +220,8 @@ def _items(ram: bytes, mario_x: int, feet_row: int) -> list[dict]:
                 continue
             dx_px = col * 16 + 8 - centre
             height = feet_row - row           # tiles above the ground Mario stands on
-            if height < 0:
-                continue                       # below Mario: a pit-floor coin, ignore
+            if height < (1 if kind == "coin" else 2):
+                continue                       # below Mario, or a block he is standing on
             # A block is hit from underneath, so the head must reach its bottom edge; a
             # coin only needs Mario's body to pass through it.
             needed = height - 1

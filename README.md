@@ -27,7 +27,7 @@ scene and three or four questions:
 
 | Question | Type | What it decides |
 |---|---|---|
-| `move` | Choice | `run_right`, `hop`, `full_jump`, `stomp`, `wait`, `back_up` |
+| `move` | Choice | `run_right`, `hop`, `full_jump`, `stomp`, `wait`, `back_up`, `run_left` |
 | `target` | Choice | which of the coins / ? blocks / coin bricks in view to go for, or `none` |
 | `hazard_first` | Noul | must a danger be dealt with before stopping to collect? |
 | `obstacle_needs_jump`, `enemy_needs_jump` | Noul | read only when `move` comes back with low confidence |
@@ -46,7 +46,8 @@ numeric stays in code. Jev is weak at arithmetic and reads instructions literall
   headroom check because World 1-2 has overhangs where no jump is possible.
 - **Invariants stay in code** whatever Jev says: no collecting with a pit two tiles
   ahead or an enemy in view, no jump until its reason is within reach, hold still
-  through a block jump.
+  through a block jump, and a wall no jump clears means turn around and go left until
+  Mario is off that ledge.
 - **No call when none is needed**: an empty scene is `run_right`, and a scene identical
   to one already answered reuses the answer.
 
@@ -110,6 +111,37 @@ PYTHONPATH=. python3 examples/jev_agent.py "Super Mario Bros.nes" out.nesmovie -
 The emulator only advances when it is stepped, so API latency never costs Mario a frame;
 it only slows the live stream down.
 
+## Laya, and running both
+
+[Laya](https://github.com/NandhaKishorM/laya) is an open-weights (Apache 2.0) typed-decision
+model with the same contract as Jev: a state, `choice` / `score` / `noul` questions,
+probabilities back. It runs locally. `--agent laya` uses it alone; `--agent duo` asks Laya
+first and Jev only when Laya's confidence is below 0.5 (confidence-gated routing), and the
+log keeps both answers so they can be compared. Laya pulls in torch and transformers, so it
+lives in its own environment:
+
+```bash
+python3 -m venv .venv-laya && .venv-laya/bin/pip install "numpy<2" torch "transformers>=4.48,<5" laya
+PYTHONPATH=python .venv-laya/bin/python -m nesenv.live "Super Mario Bros.nes" --agent duo
+```
+
+Measured here (Intel Mac, no CUDA): the 421M English checkpoint takes 1.5-7 s per decision
+on the CPU (25 s on the AMD GPU through MPS) and answers these questions close to chance,
+with confidence 0.02-0.13 (its README says as much for zero-shot typed decisions; the
+yes/no answers were better than the choices). Jev takes 0.3 s and is right most of the
+time. So on this machine `duo` costs time and gains nothing; on a CUDA GPU, where Laya
+answers in ~35 ms, the gating makes sense, and a Laya checkpoint fine-tuned on logged Jev
+decisions would make it useful. The integration is in place for that.
+
+## Why the live view runs slowly
+
+The server drives the emulator and pauses for every model call, so it produces fewer
+than 60 frames a second (about 20-30 with Jev). The browser keeps a few seconds of frames
+in a buffer and plays them at the rate they arrive: the game runs steadily in slow motion
+rather than stalling at every decision. The decision panel header shows the playback fps
+and how far behind the server the view is. Fewer calls (a bigger `DECISION_FRAMES`, more
+cache hits) or a faster model speed it up.
+
 ## What it does today
 
 Numbers from `jev-1.13.0`, September 2026, on this machine:
@@ -117,9 +149,10 @@ Numbers from `jev-1.13.0`, September 2026, on this machine:
 - Round trip to Jev is typically 330-400 ms, of which Jev itself is 70-120 ms; the rest
   is network from here. Occasional 2-6 s spikes come from outside Jev.
 - About 1,400 input tokens per call; a whole game (three lives) costs $0.01-0.02.
-- Jev clears World 1-1 most games, usually with 5-15 coins, and gets a fair way into
-  1-2 before running out of lives. It does not yet collect every coin: with an enemy
-  in view collecting is skipped, and pipe bonus rooms are not entered.
+- Jev clears World 1-1 most games, usually with 5-15 coins; the offline rule-based
+  policy (same code, no model) has cleared 1-2 and reached 1-3. Every coin is not
+  collected yet: with an enemy in view collecting is skipped, and pipe bonus rooms are
+  not entered.
 
 The decision log is the place to look when Mario dies. Each line has the scene Jev saw,
 what it answered, what the code actually did and why (`action`, `enemy_maneuver`,

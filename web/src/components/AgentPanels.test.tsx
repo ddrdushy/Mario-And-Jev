@@ -47,7 +47,7 @@ function ctx(decisions: AgentDecision[]): EmulatorContextValue {
     running: false,
     framebuffer: null,
     movie: { playing: false, frame: 0, total: 0 },
-    liveAgent: { connected: true, frame: 0 },
+    liveAgent: { connected: true, frame: 0, buffered: 0, fps: 0 },
     agentRun: {
       ...EMPTY_AGENT_RUN,
       policy: "jev",

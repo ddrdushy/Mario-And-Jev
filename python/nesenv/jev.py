@@ -72,6 +72,12 @@ MOVE_CRITERIA = {
         "what": "Step left to make room.",
         "when": "Mario is pressed against a tall wall or pipe (touching) and needs a run-up.",
     },
+    "run_left": {
+        "what": "Turn around and run left.",
+        "when": "The way right is blocked by a wall or pipe higher than 5 tiles, which no jump "
+                "clears, so the route must be behind Mario: back off the ledge he is standing "
+                "on, or back to where the floor continues underneath.",
+    },
 }
 
 BASE_QUESTIONS = {
@@ -135,7 +141,9 @@ def build_questions(scene: dict) -> dict:
 
 MIN_MOVE_CONFIDENCE = 0.35   # below this, fall back to the two Nouls
 NOUL_YES = 0.5
-HAZARD_MOVES = ("full_jump", "hop", "stomp", "wait", "back_up")
+HAZARD_MOVES = ("full_jump", "hop", "stomp", "wait", "back_up", "run_left")
+UNJUMPABLE = 5     # a wall or pipe higher than this cannot be jumped from the ground
+RETREAT_FRAMES = 240   # how long run_left keeps going before the policy is asked again
 TALL_ENEMIES = ("green koopa", "red koopa", "jumping paratroopa", "flying paratroopa", "hammer bro")
 
 # ---------------------------------------------------------------- moves -> buttons
@@ -159,6 +167,8 @@ def move_to_masks(move: str) -> list[int]:
         return [0] * DECISION_FRAMES
     if move == "back_up":
         return [LEFT] * (DECISION_FRAMES * 2)
+    if move == "run_left":
+        return [LEFT | B] * (DECISION_FRAMES * 3)
     return [RIGHT | B] * DECISION_FRAMES
 
 
@@ -196,6 +206,8 @@ class HeuristicPolicy:
         for f in terrain:
             if f["distance_tiles"] > 2:
                 continue
+            if f["kind"] in ("wall", "pipe") and f.get("first_step_tiles", f["height_tiles"]) > UNJUMPABLE:
+                return Decision("run_left", 1.0, self.name, hazard_first=1.0)
             if f["kind"] == "pit" or (f["kind"] in ("wall", "pipe") and f["height_tiles"] >= 2):
                 return Decision("full_jump", 1.0, self.name, hazard_first=1.0)
             if f["kind"] == "wall":
@@ -335,6 +347,91 @@ class JevPolicy:
                 f"(Jev itself {self.server_seconds / self.calls * 1000:.0f} ms, the rest is network)")
 
 
+class LayaPolicy:
+    """Same questions, answered locally by Laya (github.com/NandhaKishorM/laya), an
+    open-weights typed-decision model with the same choice / score / noul contract.
+    Needs the `laya` package (see python/README.md); the model loads on first use."""
+
+    name = "laya"
+
+    def __init__(self, model_id: str = "convaiinnovations/laya", device: str | None = None) -> None:
+        import laya                                   # heavy: torch + transformers
+        started = time.perf_counter()
+        self.agent = laya.load(model_id, device=device or "cpu")
+        self.model = f"{model_id} ({self.agent.device.type})"
+        self.load_seconds = time.perf_counter() - started
+        self.calls = 0
+        self.seconds = 0.0
+
+    def decide(self, scene: dict) -> Decision:
+        state = {k: v for k, v in scene.items() if not k.startswith("_")}
+        started = time.perf_counter()
+        resp = self.agent.predict(state, build_questions(state))
+        latency_ms = (time.perf_counter() - started) * 1000
+        self.calls += 1
+        self.seconds += latency_ms / 1000
+        answers = resp["answers"]
+        move = answers["move"]
+        detail = {
+            "probabilities": move["probabilities"],
+            "obstacle_needs_jump": answers["obstacle_needs_jump"]["noul"],
+            "enemy_needs_jump": answers["enemy_needs_jump"]["noul"],
+        }
+        target = "none"
+        if "target" in answers:
+            target = answers["target"]["choice"]
+            detail["target_probabilities"] = answers["target"]["probabilities"]
+            detail["target_confidence"] = answers["target"]["confidence"]
+        return Decision(move["choice"], move["confidence"], "laya", detail, latency_ms, 0, latency_ms,
+                        target, answers["hazard_first"]["noul"])
+
+    def usage_line(self) -> str:
+        if not self.calls:
+            return "no Laya calls made"
+        return f"{self.calls} Laya calls, {self.seconds / self.calls * 1000:.0f} ms/call (local, {self.model})"
+
+
+class DuoPolicy:
+    """Laya first, Jev when Laya is not sure: confidence-gated routing between the two.
+    The local model answers the easy scenes for free; the API answers the rest."""
+
+    name = "duo"
+
+    def __init__(self, laya: LayaPolicy, jev: JevPolicy, min_confidence: float = 0.5) -> None:
+        self.laya, self.jev, self.min_confidence = laya, jev, min_confidence
+        self.model = f"laya -> jev at confidence < {min_confidence}"
+        self.laya_kept = 0
+
+    def decide(self, scene: dict) -> Decision:
+        first = self.laya.decide(scene)
+        if first.confidence >= self.min_confidence:
+            self.laya_kept += 1
+            return first
+        second = self.jev.decide(scene)
+        # Both answers are kept in the record: the log shows what Laya would have done.
+        second.detail = {**second.detail, "laya_move": first.move, "laya_confidence": round(first.confidence, 3),
+                         "laya_ms": round(first.latency_ms, 1)}
+        second.latency_ms += first.latency_ms
+        return second
+
+    def usage_line(self) -> str:
+        return (f"duo: Laya answered {self.laya_kept}, Jev the rest. {self.laya.usage_line()}; "
+                f"{self.jev.usage_line()}")
+
+
+def make_policy(name: str, model: str = DEFAULT_MODEL, laya_device: str | None = None):
+    """The policy behind an --agent / --policy name."""
+    if name == "jev":
+        return JevPolicy(model=model)
+    if name == "heuristic":
+        return HeuristicPolicy()
+    if name == "laya":
+        return LayaPolicy(device=laya_device)
+    if name == "duo":
+        return DuoPolicy(LayaPolicy(device=laya_device), JevPolicy(model=model))
+    raise ValueError(f"unknown policy {name!r}")
+
+
 def load_api_key() -> str | None:
     key = os.environ.get("TYPESAFE_API_KEY")
     if key:
@@ -465,6 +562,7 @@ class Player:
         self.flagged = False
         self.seek: tuple[int, int, int] | None = None   # (block column, A frames, deadline)
         self.no_collect_until = 0     # after a seek is abandoned for an enemy, run the move instead
+        self.retreat: tuple[int, int] | None = None     # (feet row when run_left began, deadline)
         self.coins = 0
         self.outcome: str | None = None   # set only when the whole game is over
         self.lives_played = 0
@@ -533,7 +631,7 @@ class Player:
             return 0
         level = (meta["world"], meta["stage"])
         if self.level is not None and level != self.level:
-            self.max_x, self.stall, self.queue, self.flagged, self.seek = 0, 0, [], False, None
+            self.max_x, self.stall, self.queue, self.flagged, self.seek, self.retreat = 0, 0, [], False, None, None
         self.level = level
         if meta["flagpole"] and not self.flagged and self.max_x > 0:
             self.flagged = True
@@ -553,6 +651,14 @@ class Player:
 
         if self.queue:
             return self.queue.pop(0)
+        if self.retreat:
+            start_row, deadline = self.retreat
+            walls = [f for f in (scene["terrain_ahead"] if isinstance(scene["terrain_ahead"], list) else [])
+                     if f["kind"] in ("wall", "pipe") and f.get("first_step_tiles", f["height_tiles"]) > UNJUMPABLE]
+            if meta["on_ground"] and (meta["feet_row"] != start_row or not walls or self.frame > deadline):
+                self.retreat = None
+            else:
+                return LEFT | B
         seeking = self._seek_mask(scene)
         if seeking is not None:
             return seeking
@@ -561,7 +667,7 @@ class Player:
             enemies_air = scene["enemies"] if isinstance(scene["enemies"], list) else []
             if any(e["direction"] == "ahead" and e["distance_tiles"] <= 3 and not e["level"].startswith("above")
                    for e in enemies_air):
-                return 0
+                return LEFT               # air control: kill the forward momentum before landing
             return RIGHT | B
 
         self.ground_row = meta["feet_row"]
@@ -591,16 +697,38 @@ class Player:
         # so a jump move only fires once its reason is within reach. Use code when you can.
         terrain_now = scene["terrain_ahead"] if isinstance(scene["terrain_ahead"], list) else []
         enemies_now = scene["enemies"] if isinstance(scene["enemies"], list) else []
+        # A wall no jump clears: the route is behind Mario (off the ledge, or under the
+        # platform). Repeating full_jump into it is how he hangs; go left instead.
+        blocked = [f for f in terrain_now if f["kind"] in ("wall", "pipe")
+                   and f.get("first_step_tiles", f["height_tiles"]) > UNJUMPABLE and f["distance_tiles"] <= 2]
+        if blocked and decision.move != "run_left":
+            decision.move = "run_left"
+            decision.detail = {**decision.detail, "unjumpable_wall": True}
+        if decision.move == "run_left":
+            # Keep going left until Mario is on a different level (dropped off the ledge)
+            # or the wall is well out of view; a single burst just turns him back into it.
+            self.retreat = (meta["feet_row"], self.frame + RETREAT_FRAMES)
+
         # Obstacles stand still, so a jump 3+ tiles early lands short; enemies walk toward
         # Mario, so a running jump from up to 5 tiles away clears them (and a koopa, being
         # tall, needs that head start).
-        obstacles = [f["distance_tiles"] for f in terrain_now if f["kind"] in ("pit", "wall", "pipe")]
+        obstacles = [f["distance_tiles"] for f in terrain_now if f["kind"] in ("pit", "wall", "pipe")
+                     and not (f["kind"] != "pit" and f.get("first_step_tiles", f["height_tiles"]) > UNJUMPABLE)]
         foes = [e["distance_tiles"] for e in enemies_now
                 if e["direction"] == "ahead" and e["level"].startswith("same")]
         if decision.move == "stomp":
             too_early = not foes or min(foes) > 1.9
         else:
             too_early = not ((obstacles and min(obstacles) < 3.0) or (foes and min(foes) < 5.0))
+        # Under a low ceiling a jump bonks and drops short: hold the pit jump until the
+        # overhang ends or the edge is right here, and make it a hop (A cut short bonks less).
+        pits = [f["distance_tiles"] for f in terrain_now if f["kind"] == "pit"]
+        if decision.move in ("full_jump", "hop") and pits and meta["headroom"] < 4:
+            if min(pits) > 1:
+                too_early = True
+            else:
+                decision.move = "hop"
+                decision.detail = {**decision.detail, "low_ceiling_hop": True}
         if decision.move in ("full_jump", "hop", "stomp") and (obstacles or foes) and too_early:
             decision = Decision("run_right", decision.confidence, decision.source, decision.detail,
                                 decision.latency_ms, decision.input_tokens, decision.server_ms,

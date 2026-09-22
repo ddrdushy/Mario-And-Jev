@@ -178,6 +178,10 @@ invariants stay in code regardless of what Jev says: no collecting with an enemy
 height in view or a pit within two tiles, no jump until its reason is within 2.5 tiles, a
 full jump instead of a hop for two enemies in a row.
 
+`--policy laya` / `--agent laya` answer the same questions with the local
+[Laya](https://github.com/NandhaKishorM/laya) model, and `duo` asks Laya first and Jev when
+Laya is unsure (needs the `laya` package: see the top-level README).
+
 The run prints calls, tokens, cost and latency, and writes a `.jsonl` decision log next to
 the movie; the live server writes one per game under `logs/` at the repo root. `--policy heuristic` (or `--agent heuristic`) runs the same harness with an
 offline rule-based policy, so you can test without a key. The emulator only advances when

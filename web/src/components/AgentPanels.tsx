@@ -50,6 +50,7 @@ export function niceCeil(value: number): number {
 
 function sourceLabel(source: string): string {
   if (source === "jev") return "Jev";
+  if (source === "laya") return "Laya (local)";
   if (source === "jev-fallback") return "Jev, low confidence";
   if (source === "jev-cached") return "Jev, cached answer";
   if (source === "code") return "code, no call needed";
@@ -95,7 +96,7 @@ function Meter({
 }
 
 export function AgentDecisionPanel({ revealDelay, className }: PanelProps): JSX.Element {
-  const { agentRun } = useEmulator();
+  const { agentRun, liveAgent } = useEmulator();
   const { decisions, moves } = agentRun;
   const current: AgentDecision | undefined = decisions[decisions.length - 1];
   const recent = [...decisions].reverse().slice(0, 40);
@@ -107,6 +108,9 @@ export function AgentDecisionPanel({ revealDelay, className }: PanelProps): JSX.
         agentRun.policy ? (
           <span data-testid="agent-policy">
             {agentRun.policy} · {agentRun.model}
+            {liveAgent.connected
+              ? ` · ${liveAgent.fps ? `${liveAgent.fps} fps` : "buffering"} · ${(liveAgent.buffered / 60).toFixed(1)}s ahead`
+              : ""}
           </span>
         ) : undefined
       }

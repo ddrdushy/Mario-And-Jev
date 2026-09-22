@@ -45,3 +45,4 @@ python/dist/
 
 # Live-agent decision logs (python -m nesenv.live)
 logs/
+.venv-laya/

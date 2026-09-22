@@ -29,7 +29,7 @@ function makeCtx(currentValue: number): EmulatorContextValue {
     running: false,
     framebuffer: null,
     movie: { playing: false, frame: 0, total: 0 },
-    liveAgent: { connected: false, frame: 0 },
+    liveAgent: { connected: false, frame: 0, buffered: 0, fps: 0 },
     agentRun: EMPTY_AGENT_RUN,
     dbg: { readMemory: () => currentValue } as unknown as Debugger,
     actions: { writeMemory } as unknown as EmulatorContextValue["actions"],

@@ -7,6 +7,7 @@ no WebSocket dependency: SSE is plain HTTP and works with the built-in http.serv
 
     python -m nesenv.live "Super Mario Bros.nes" --agent scripted --port 8000
     python -m nesenv.live "Super Mario Bros.nes" --agent jev     # TypeSafe Jev decides
+    python -m nesenv.live "Super Mario Bros.nes" --agent duo     # Laya locally, Jev when unsure
 
 Then click "Spawn Agent" in NES Studio. Swap the policy in `agent_action` for a
 trained network to watch it learn; the streaming protocol does not change.
@@ -80,7 +81,7 @@ def drive(send) -> None:
     while True:
         send("reset", "")
         nes.reset()
-        if AGENT in ("jev", "heuristic"):
+        if AGENT in ("jev", "heuristic", "laya", "duo"):
             policy = drive_player(nes, send, policy)  # reused, so its answer cache survives lives
             continue
         state: dict = {"offset": random.randint(0, 23)}
@@ -115,9 +116,9 @@ def drive(send) -> None:
 def drive_player(nes: Nes, send, policy=None):
     """One whole game (all lives, level after level) played by a nesenv.jev Player.
     Returns the policy so the caller can hand it back for the next game."""
-    from .jev import MOVE_CRITERIA, PRICE_PER_MTOK, HeuristicPolicy, JevPolicy, Player
+    from .jev import MOVE_CRITERIA, PRICE_PER_MTOK, Player, make_policy
 
-    policy = policy or (JevPolicy() if AGENT == "jev" else HeuristicPolicy())
+    policy = policy or make_policy(AGENT)
     send("agent", json.dumps({
         "policy": policy.name, "model": policy.model,
         "moves": list(MOVE_CRITERIA), "price_per_mtok": PRICE_PER_MTOK,
@@ -184,7 +185,7 @@ def main() -> int:
     global ROM, AGENT
     p = argparse.ArgumentParser(description="Stream a live NES agent over SSE.")
     p.add_argument("rom")
-    p.add_argument("--agent", choices=["scripted", "random", "jev", "heuristic"], default="scripted")
+    p.add_argument("--agent", choices=["scripted", "random", "jev", "heuristic", "laya", "duo"], default="scripted")
     p.add_argument("--port", type=int, default=8000)
     args = p.parse_args()
 

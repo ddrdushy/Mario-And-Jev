@@ -110,6 +110,12 @@ export interface AgentRun {
 }
 
 export const AGENT_HISTORY = 120;
+/** Frames held back before live playback starts, and before it resumes after running dry. */
+export const LIVE_BUFFER_START = 180;
+export const LIVE_BUFFER_RESUME = 60;
+export const LIVE_BUFFER_CATCH_UP = 300;
+export const LIVE_MIN_FPS = 12;
+export const LIVE_RATE_WINDOW_MS = 4000;
 
 /** True when this decision was a real policy call, not a cache hit or a code shortcut. */
 export function isModelCall(d: AgentDecision): boolean {
@@ -139,7 +145,8 @@ export interface EmulatorContextValue {
   running: boolean;
   framebuffer: Uint8ClampedArray | null;
   movie: { playing: boolean; frame: number; total: number };
-  liveAgent: { connected: boolean; frame: number };
+  /** `buffered` is how many streamed frames wait in the jitter buffer (about 60 per second of play). */
+  liveAgent: { connected: boolean; frame: number; buffered: number; fps: number };
   agentRun: AgentRun;
   dbg: Debugger | null;
   actions: EmulatorActions;
@@ -163,7 +170,8 @@ export function EmulatorProvider(props: {
   );
   const [movie, setMovie] = useState({ playing: false, frame: 0, total: 0 });
   const movieRafRef = useRef<number | null>(null);
-  const [liveAgent, setLiveAgent] = useState({ connected: false, frame: 0 });
+  const [liveAgent, setLiveAgent] = useState({ connected: false, frame: 0, buffered: 0, fps: 0 });
+  const liveRafRef = useRef<number | null>(null);
   const [agentRun, setAgentRun] = useState<AgentRun>(EMPTY_AGENT_RUN);
   const liveSourceRef = useRef<EventSource | null>(null);
   const liveRomRef = useRef<Uint8Array | null>(null);
@@ -310,7 +318,11 @@ export function EmulatorProvider(props: {
       liveSourceRef.current.close();
       liveSourceRef.current = null;
     }
-    setLiveAgent((s) => (s.connected ? { connected: false, frame: 0 } : s));
+    if (liveRafRef.current !== null) {
+      cancelAnimationFrame(liveRafRef.current);
+      liveRafRef.current = null;
+    }
+    setLiveAgent((s) => (s.connected ? { connected: false, frame: 0, buffered: 0, fps: 0 } : s));
   }, []);
 
   const stop = useCallback(() => {
@@ -393,6 +405,11 @@ export function EmulatorProvider(props: {
   // Watch a live agent: connect to the SSE stream and re-simulate the streamed
   // actions on the local core. Because the core is deterministic, the browser
   // reproduces exactly what the agent is doing on the server, frame for frame.
+  //
+  // The server pauses for every model call, so its frames arrive in bursts. They
+  // are queued here and played back at a steady 60 fps from behind a small buffer
+  // (a jitter buffer): a few seconds of delay, no stutter. Agent events ride the
+  // same queue so a decision shows up exactly when its frame plays.
   const connectLiveAgent = useCallback(
     (url: string = LIVE_AGENT_URL) => {
       const bridge = dbgRef.current;
@@ -402,65 +419,137 @@ export function EmulatorProvider(props: {
       disconnectLiveAgent();
       audioRef.current.resume();
 
-      let frames = 0;
+      type Item =
+        | { t: "step"; mask: number }
+        | { t: "reset" }
+        | { t: "agent"; info: Record<string, unknown> }
+        | { t: "decision"; d: AgentDecision }
+        | { t: "outcome"; o: LifeOutcome };
+      const queue: Item[] = [];
+      let queuedSteps = 0;
+      let played = 0;
+      let buffering = true;
+      let last = performance.now();
+      let carry = 0;
+
       const es = new EventSource(url);
       liveSourceRef.current = es;
       setAgentRun(EMPTY_AGENT_RUN);
 
-      // Narration from the jev / heuristic agents: who is playing, each decision
-      // with its latency, and how each life ended. Other agents never send these.
-      es.addEventListener("agent", (ev) => {
-        const info = JSON.parse((ev as MessageEvent).data);
-        setAgentRun((run) => ({
-          ...run,
-          policy: info.policy,
-          model: info.model,
-          moves: info.moves ?? [],
-          pricePerMtok: info.price_per_mtok ?? 0,
-          lives: run.lives + 1,
-        }));
-      });
-      es.addEventListener("decision", (ev) => {
-        const d = JSON.parse((ev as MessageEvent).data) as AgentDecision;
-        setAgentRun((run) => ({
-          ...run,
-          decisions: [...run.decisions, d].slice(-AGENT_HISTORY),
-          calls: run.calls + (isModelCall(d) ? 1 : 0),
-          decided: run.decided + 1,
-          fallbacks: run.fallbacks + (d.source === "jev-fallback" ? 1 : 0),
-          inputTokens: run.inputTokens + d.input_tokens,
-          latencySumMs: run.latencySumMs + (isModelCall(d) ? d.latency_ms : 0),
-        }));
-      });
-      es.addEventListener("outcome", (ev) => {
-        const o = JSON.parse((ev as MessageEvent).data);
-        setAgentRun((run) => ({
-          ...run,
-          lastOutcome: o,
-          outcomes: [...run.outcomes, o].slice(-50),
-        }));
-      });
-
+      // Arrival times of recent frames: the server produces fewer than 60 a second
+      // while it waits on the model, and playback follows that rate so the game runs
+      // steadily (in slow motion when it must) instead of stalling at every call.
+      const arrivals: number[] = [];
+      const push = (item: Item) => {
+        queue.push(item);
+        if (item.t === "step") {
+          queuedSteps += 1;
+          arrivals.push(performance.now());
+        }
+      };
+      const arrivalRate = (now: number) => {
+        while (arrivals.length && arrivals[0] < now - LIVE_RATE_WINDOW_MS) arrivals.shift();
+        return (arrivals.length * 1000) / LIVE_RATE_WINDOW_MS;
+      };
       es.addEventListener("rom", (ev) => {
         const rom = base64ToBytes((ev as MessageEvent).data);
         liveRomRef.current = rom;
         bridge.loadRom(rom);
       });
-      es.addEventListener("reset", () => {
-        if (liveRomRef.current) bridge.loadRom(liveRomRef.current); // re-boot
-      });
+      es.addEventListener("reset", () => push({ t: "reset" }));
       es.addEventListener("step", (ev) => {
-        const mask = parseInt((ev as MessageEvent).data, 10) || 0;
-        bridge.setController(mask);
-        bridge.runFrame();
-        setFramebuffer(new Uint8ClampedArray(bridge.getFramebuffer()));
-        const samples = bridge.audioDrain(4096);
-        if (samples.length) audioRef.current.pump(samples);
-        frames += 1;
-        if (frames % 6 === 0) setLiveAgent({ connected: true, frame: frames });
+        push({ t: "step", mask: parseInt((ev as MessageEvent).data, 10) || 0 });
       });
+      es.addEventListener("agent", (ev) => {
+        push({ t: "agent", info: JSON.parse((ev as MessageEvent).data) });
+      });
+      es.addEventListener("decision", (ev) => {
+        push({ t: "decision", d: JSON.parse((ev as MessageEvent).data) as AgentDecision });
+      });
+      es.addEventListener("outcome", (ev) => {
+        push({ t: "outcome", o: JSON.parse((ev as MessageEvent).data) });
+      });
+
+      const apply = (item: Item) => {
+        if (item.t === "step") {
+          bridge.setController(item.mask);
+          bridge.runFrame();
+          setFramebuffer(new Uint8ClampedArray(bridge.getFramebuffer()));
+          const samples = bridge.audioDrain(4096);
+          if (samples.length) audioRef.current.pump(samples);
+          played += 1;
+          queuedSteps -= 1;
+        } else if (item.t === "reset") {
+          if (liveRomRef.current) bridge.loadRom(liveRomRef.current); // re-boot
+        } else if (item.t === "agent") {
+          const info = item.info as { policy: string; model: string; moves?: string[]; price_per_mtok?: number };
+          setAgentRun((run) => ({
+            ...run,
+            policy: info.policy,
+            model: info.model,
+            moves: info.moves ?? [],
+            pricePerMtok: info.price_per_mtok ?? 0,
+            lives: run.lives + 1,
+          }));
+        } else if (item.t === "decision") {
+          const d = item.d;
+          setAgentRun((run) => ({
+            ...run,
+            decisions: [...run.decisions, d].slice(-AGENT_HISTORY),
+            calls: run.calls + (isModelCall(d) ? 1 : 0),
+            decided: run.decided + 1,
+            fallbacks: run.fallbacks + (d.source === "jev-fallback" ? 1 : 0),
+            inputTokens: run.inputTokens + d.input_tokens,
+            latencySumMs: run.latencySumMs + (isModelCall(d) ? d.latency_ms : 0),
+          }));
+        } else {
+          setAgentRun((run) => ({
+            ...run,
+            lastOutcome: item.o,
+            outcomes: [...run.outcomes, item.o].slice(-50),
+          }));
+        }
+      };
+
+      const tick = (now: number) => {
+        if (liveSourceRef.current !== es) return; // disconnected
+        // Start (or resume) only with a cushion of frames, then hold 60 fps from it.
+        if (buffering && queuedSteps >= (played === 0 ? LIVE_BUFFER_START : LIVE_BUFFER_RESUME)) {
+          buffering = false;
+          last = now;
+          carry = 0;
+        }
+        if (!buffering) {
+          // Play at the pace frames arrive (never above 60 fps, never below a crawl);
+          // with a deep buffer, run at full speed to catch up.
+          const fps = queuedSteps > LIVE_BUFFER_CATCH_UP
+            ? 60
+            : Math.max(LIVE_MIN_FPS, Math.min(60, arrivalRate(now) * 0.95));
+          carry += ((now - last) * fps) / 1000;
+          last = now;
+          let steps = Math.min(Math.floor(carry), 4); // never rush more than 4 frames per tick
+          carry -= steps;
+          while (steps > 0) {
+            if (queuedSteps === 0) {
+              buffering = true; // ran dry: refill before playing on
+              break;
+            }
+            const item = queue.shift() as Item;
+            apply(item);
+            if (item.t === "step") steps -= 1;
+          }
+          if (played % 6 === 0) {
+            setLiveAgent({ connected: true, frame: played, buffered: queuedSteps, fps: Math.round(fps) });
+          }
+        } else if (queuedSteps % 30 === 0) {
+          setLiveAgent({ connected: true, frame: played, buffered: queuedSteps, fps: 0 });
+        }
+        liveRafRef.current = requestAnimationFrame(tick);
+      };
+      liveRafRef.current = requestAnimationFrame(tick);
+
       es.onopen = () => {
-        setLiveAgent({ connected: true, frame: 0 });
+        setLiveAgent({ connected: true, frame: 0, buffered: 0, fps: 0 });
         addToast("Live agent connected", "info");
       };
       es.onerror = () => {
