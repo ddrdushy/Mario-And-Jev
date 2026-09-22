@@ -146,6 +146,7 @@ HAZARD_MOVES = ("full_jump", "hop", "stomp", "wait", "back_up", "run_left", "up_
 UNJUMPABLE = 5     # a wall or pipe higher than this cannot be jumped from the ground
 RETREAT_FRAMES = 240   # how long run_left keeps going before the policy is asked again
 HOP_LANDING = 4.7      # tiles a running hop covers before touching down (measured)
+ITEM_BUDGET_FRAMES = 300   # frames an item may be worked on without paying out before it is given up
 FULL_LANDING = 7.9     # tiles a running full jump covers
 TALL_ENEMIES = ("green koopa", "red koopa", "jumping paratroopa", "flying paratroopa", "hammer bro")
 
@@ -619,6 +620,8 @@ class Player:
         self.pushed_at = -1           # x // 32 where Mario last tried walking into a tall wall
         self.enter_pipe: tuple[dict, int] | None = None   # (pipe top to go down, deadline)
         self.ledge_x, self.ledge_since, self.ledge_until = -1, 0, 0   # lining-up stall detection
+        self.item_since: dict[tuple[int, int], tuple[int, int]] = {}   # item -> (first frame, coins then)
+        self.given_up: set[tuple[int, int]] = set()
         self.coins = 0
         self.outcome: str | None = None   # set only when the whole game is over
         self.lives_played = 0
@@ -926,13 +929,35 @@ class Player:
         # Hazards first; otherwise go for the item Jev picked; otherwise the move.
         plan = None
         item = next((i for i in meta["items"] if i["id"] == decision.target), None)
+        # An item that has been worked on for a while without a coin to show for it is
+        # not going to happen from here (a block with something in the way, a coin the
+        # jump never reaches): give it up for this life rather than loop on it.
+        if item is not None:
+            key = (item["_col"], item["_row"])
+            if key in self.given_up:
+                item = None
+            else:
+                first_frame, coins_then = self.item_since.get(key, (self.frame, meta["coins"]))
+                self.item_since[key] = (first_frame, coins_then)
+                if meta["coins"] > coins_then:
+                    self.item_since[key] = (self.frame, meta["coins"])
+                elif self.frame - first_frame > ITEM_BUDGET_FRAMES:
+                    self.given_up.add(key)
+                    decision.detail = {**decision.detail, "gave_up_item": decision.target}
+                    item = None
         terrain = scene["terrain_ahead"] if isinstance(scene["terrain_ahead"], list) else []
         enemies = scene["enemies"] if isinstance(scene["enemies"], list) else []
         pit_ahead = any(f["kind"] == "pit" and f["distance_tiles"] <= 2 for f in terrain)
         # Stopping under a block with an enemy walking up is how Mario dies, so let the
         # move deal with anything at his height first; the block is still there afterwards.
-        enemy_near = any(e["level"].startswith("same") and (e["direction"] == "ahead" or e["distance_tiles"] <= 4)
+        enemy_near = any((e["level"].startswith("same") and (e["direction"] == "ahead" or e["distance_tiles"] <= 6))
+                         or (e["level"].startswith("below") and e["distance_tiles"] <= 5)   # would land on it
                          for e in enemies)
+        # Skidding around for an item right at a ledge's edge while running ends with a
+        # fall off it; let the move carry Mario past the edge first.
+        edge_risk = abs(meta["vx"]) > WALK_SPEED and any(
+            f["kind"] == "drop" and f["distance_tiles"] <= 1 for f in terrain)
+        enemy_near = enemy_near or edge_risk
         hazard = decision.move in HAZARD_MOVES and decision.hazard_first > NOUL_YES
         if item and not hazard and not pit_ahead and not enemy_near and self.frame >= self.no_collect_until:
             plan = plan_collect(item, meta)
