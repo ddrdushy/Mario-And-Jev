@@ -39,6 +39,7 @@ MOVE_CRITERIA = {
         "what": "Keep running right. Nothing needs a jump yet.",
         "when": "No pit, wall, pipe or same-height enemy is within 2 tiles ahead.",
         "also": "A ledge that drops down is safe and is not a pit: run off it, do not jump. "
+                "A sideways pipe opening is walked into, never jumped at. "
                 "Anything near or far away does not need a move yet.",
     },
     "hop": {
@@ -141,9 +142,11 @@ def build_questions(scene: dict) -> dict:
 
 MIN_MOVE_CONFIDENCE = 0.35   # below this, fall back to the two Nouls
 NOUL_YES = 0.5
-HAZARD_MOVES = ("full_jump", "hop", "stomp", "wait", "back_up", "run_left")
+HAZARD_MOVES = ("full_jump", "hop", "stomp", "wait", "back_up", "run_left", "up_over")
 UNJUMPABLE = 5     # a wall or pipe higher than this cannot be jumped from the ground
 RETREAT_FRAMES = 240   # how long run_left keeps going before the policy is asked again
+HOP_LANDING = 4.7      # tiles a running hop covers before touching down (measured)
+FULL_LANDING = 7.9     # tiles a running full jump covers
 TALL_ENEMIES = ("green koopa", "red koopa", "jumping paratroopa", "flying paratroopa", "hammer bro")
 
 # ---------------------------------------------------------------- moves -> buttons
@@ -163,6 +166,8 @@ def move_to_masks(move: str) -> list[int]:
         return [RIGHT | B | A] * FULL_JUMP_FRAMES
     if move == "stomp":
         return [A] * 20 + [0] * 26
+    if move == "up_over":
+        return [A] * 18 + [A | RIGHT] * 14 + [RIGHT] * 22
     if move == "wait":
         return [0] * DECISION_FRAMES
     if move == "back_up":
@@ -493,6 +498,56 @@ def seek_mask(dx: int, vx: int) -> int | None:
     return RIGHT if dx > 0 else LEFT
 
 
+# Measured jump arcs as (dx at peak, peak height, landing dx) in tiles; a parabola through
+# those three points is close enough to say whether an arc clears a ledge and lands on it.
+JUMP_ARCS = {
+    "stand_full": (1.0, 4.1, 2.75),
+    "walk_full": (3.06, 4.44, 5.19),
+    "run_full": (4.06, 4.94, 7.94),
+    "walk_hop": (1.25, 2.44, 2.88),
+    "run_hop": (2.19, 2.81, 4.69),
+}
+
+
+def _arc_height(arc: tuple[float, float, float], dx: float) -> float:
+    peak_dx, peak, land = arc
+    if dx <= peak_dx:
+        return peak * (1 - ((peak_dx - dx) / peak_dx) ** 2)
+    if dx >= land:
+        return -1.0
+    return peak * (1 - ((dx - peak_dx) / (land - peak_dx)) ** 2)
+
+
+def lands_on(arc: tuple[float, float, float], start: float, end: float, height: float) -> bool:
+    """Does this arc clear the ledge's near edge and come down on top of it?"""
+    edge = start - 0.5
+    if _arc_height(arc, edge) < height + 0.15:
+        return False
+    # the arc must still be above the ledge somewhere on it and come down before its end
+    for dx in (edge + 0.25 * k for k in range(1, 40)):
+        if dx > end + 0.5:
+            return False
+        if _arc_height(arc, dx) < height:
+            return dx >= edge
+    return False
+
+
+def plan_ledge_jump(ledge: dict, vx: int) -> str | None:
+    """Which move lands on `ledge` from here at the current speed, or None."""
+    start, height = ledge["distance_tiles"], ledge["height_tiles"]
+    end = start + ledge["width_tiles"] - 1
+    speed = "run" if abs(vx) > WALK_SPEED else "walk" if abs(vx) > STOPPED else "stand"
+    order = {"run": ["run_full", "run_hop"], "walk": ["walk_full", "walk_hop"], "stand": ["stand_full"]}[speed]
+    if height < 4:                        # a 4-high ledge leaves no margin for an arc
+        for name in order:
+            if lands_on(JUMP_ARCS[name], start, end, height):
+                return "full_jump" if name.endswith("full") else "hop"
+    if speed == "stand" and start <= 2 and height <= 4:
+        # From the edge: straight up to full height, then drift over onto the ledge.
+        return "up_over"
+    return None
+
+
 def plan_collect(item: dict, meta: dict) -> list[int] | None:
     """Masks that move toward `item` and jump for it when in position, or None if this
     item cannot be reached from the ground here. Called again after the masks run out, so
@@ -563,6 +618,7 @@ class Player:
         self.retreat: tuple[int, int] | None = None     # (feet row when run_left began, deadline)
         self.pushed_at = -1           # x // 32 where Mario last tried walking into a tall wall
         self.enter_pipe: tuple[dict, int] | None = None   # (pipe top to go down, deadline)
+        self.ledge_x, self.ledge_since, self.ledge_until = -1, 0, 0   # lining-up stall detection
         self.coins = 0
         self.outcome: str | None = None   # set only when the whole game is over
         self.lives_played = 0
@@ -748,6 +804,15 @@ class Player:
         # so a jump move only fires once its reason is within reach. Use code when you can.
         terrain_now = scene["terrain_ahead"] if isinstance(scene["terrain_ahead"], list) else []
         enemies_now = scene["enemies"] if isinstance(scene["enemies"], list) else []
+        # The open end of a sideways pipe is a doorway: walk in, and never jump at it
+        # (a jump lands on top of it, where there is nowhere to go).
+        if any(f["kind"] == "side_pipe" and f["distance_tiles"] <= 4 for f in terrain_now):
+            self.queue = [RIGHT | B] * 12
+            decision.move = "run_right"
+            decision.detail = {**decision.detail, "side_pipe": True}
+            self._record(decision, scene, meta, "walk into the sideways pipe")
+            return self.queue.pop(0)
+
         # A wall no jump clears: the route is behind Mario (off the ledge, or under the
         # platform). Repeating full_jump into it is how he hangs; go left instead.
         blocked = [f for f in terrain_now if f["kind"] in ("wall", "pipe")
@@ -787,6 +852,53 @@ class Player:
             too_early = not foes or min(foes) > 1.9
         else:
             too_early = not ((obstacles and min(obstacles) < 3.0) or (foes and min(foes) < 5.0))
+        # Where does the jump land? A running hop comes down ~4.7 tiles on, a full jump
+        # ~7.9. If that spot is inside a pit, take the other jump when it will do.
+        pit_spans = [(f["distance_tiles"], f["distance_tiles"] + f["width_tiles"]) for f in terrain_now
+                     if f["kind"] == "pit"]
+        def lands_in_pit(move: str) -> bool:
+            land = HOP_LANDING if move == "hop" else FULL_LANDING
+            return any(start - 0.5 <= land <= end + 0.5 for start, end in pit_spans)
+        low_obstacle = all(f.get("first_step_tiles", 9) <= 2 for f in terrain_now
+                           if f["kind"] in ("wall", "pipe") and f["distance_tiles"] <= 3)
+        if decision.move == "full_jump" and lands_in_pit("full_jump") and low_obstacle and not lands_in_pit("hop"):
+            decision.move = "hop"
+            decision.detail = {**decision.detail, "landing_adjusted": "hop"}
+        elif decision.move == "hop" and lands_in_pit("hop") and not lands_in_pit("full_jump"):
+            decision.move = "full_jump"
+            decision.detail = {**decision.detail, "landing_adjusted": "full_jump"}
+
+        # A pit with a ledge above beyond it (tree tops): pick the jump whose arc clears
+        # the ledge's edge and comes down on it, from the measured jump profiles. If none
+        # works from here at this speed, slow down or step closer first.
+        ledges = [f for f in terrain_now if f["kind"] == "ledge above"]
+        first_pit = min((start for start, _ in pit_spans), default=99)
+        step_before_pit = any(f["kind"] in ("wall", "pipe") and f["distance_tiles"] < first_pit for f in terrain_now)
+        if (decision.move in ("full_jump", "hop", "run_right") and pit_spans and ledges
+                and not step_before_pit and self.frame >= self.ledge_until):
+            target = min((l for l in ledges if l["distance_tiles"] >= first_pit),
+                         key=lambda l: l["distance_tiles"], default=None)
+            if target is not None:
+                choice = plan_ledge_jump(target, meta["vx"])
+                if choice is None:
+                    # Nothing lands from here: walk up to the edge (or brake) and look again,
+                    # but not forever: if lining up stalls, hand the pit back to the policy.
+                    if meta["x"] != self.ledge_x:
+                        self.ledge_x, self.ledge_since = meta["x"], self.frame
+                    elif self.frame - self.ledge_since > 60:
+                        self.ledge_until = self.frame + 300
+                    if abs(meta["vx"]) > STOPPED:
+                        self.queue = [LEFT if meta["vx"] > 0 else RIGHT, 0]
+                    else:
+                        self.queue = [RIGHT] * (2 if first_pit <= 1 else 4) + [0] * 4
+                    decision.move = "wait"
+                    decision.detail = {**decision.detail, "ledge_approach": target["distance_tiles"]}
+                    self._record(decision, scene, meta, f"line up for the ledge {target['height_tiles']} up")
+                    return self.queue.pop(0)
+                decision.move = choice
+                decision.detail = {**decision.detail, "ledge_jump": choice}
+                too_early = False
+
         # Under a low ceiling a jump bonks and drops short: hold the pit jump until the
         # overhang ends or the edge is right here, and make it a hop (A cut short bonks less).
         pits = [f["distance_tiles"] for f in terrain_now if f["kind"] == "pit"]

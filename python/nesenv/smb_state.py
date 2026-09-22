@@ -57,6 +57,7 @@ PLATFORM_TYPES = range(0x24, 0x2D)
 EMPTY_TILES = {0x00, 0xC2, 0xC3}      # air and coins
 FLAG_TILES = {0x24, 0x25}             # flagpole: touchable, not solid
 PIPE_TILES = range(0x10, 0x22)
+SIDE_PIPE_TILES = {0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21}   # the mouth of a sideways pipe: walk in
 
 # Things worth going out of the way for (metatile ids, checked against 1-1's buffer).
 COIN_TILES = {0xC2, 0xC3}
@@ -107,6 +108,8 @@ def _distance_words(tiles: float) -> str:
 def _column(ram: bytes, level_x: int, feet_row: int, body_rows: int) -> dict:
     """Describe one 16px column relative to the row Mario stands on."""
     blocked = any(_solid(_tile(ram, level_x, feet_row - 1 - i)) for i in range(body_rows))
+    if blocked and _tile(ram, level_x, feet_row - 1) in SIDE_PIPE_TILES:
+        return {"kind": "side_pipe", "height": 2}
     if blocked:
         top = feet_row - 1
         while top - 1 >= 0 and _solid(_tile(ram, level_x, top - 1)):
@@ -147,10 +150,31 @@ def _terrain(ram: bytes, mario_x: int, feet_row: int, body_rows: int) -> tuple[l
             "_near_height": col["height"],   # the first column's own height: a staircase starts low
             "_end": i,
         })
+    # Ledges above Mario's level (tree tops, mushroom platforms): landing targets a
+    # jump can reach, described separately from what is at his feet.
+    ledges: list[dict] = []
+    for i in range(1, LOOKAHEAD + 1):
+        px = mario_x + 16 * i
+        for up in range(1, REACH_TILES + 2):
+            row = feet_row - up
+            if row >= 0 and _solid(_tile(ram, px, row)) and not _solid(_tile(ram, px, row - 1)) \
+                    and not any(_solid(_tile(ram, px, r)) for r in range(row + 1, feet_row)):
+                last = ledges[-1] if ledges else None
+                if last and last["height_tiles"] == up and last["_end"] == i - 1:
+                    last["_end"] = i
+                    last["width_tiles"] += 1
+                else:
+                    ledges.append({"kind": "ledge above", "height_tiles": up, "distance": _distance_words(i),
+                                   "distance_tiles": i, "width_tiles": 1, "_end": i})
+                break
+    for l in ledges:
+        del l["_end"]
+        l["note"] = "a platform above Mario's level that a jump can land on"
+    features.extend(l for l in ledges if l["height_tiles"] <= REACH_TILES)
     words = []
     for f in features:
-        del f["_end"]
-        near = f.pop("_near_height")
+        f.pop("_end", None)
+        near = f.pop("_near_height", f.get("height_tiles", 0))
         if f["kind"] in ("wall", "pipe"):
             f["first_step_tiles"] = near
             if near < f["height_tiles"]:
@@ -164,6 +188,14 @@ def _terrain(ram: bytes, mario_x: int, feet_row: int, body_rows: int) -> tuple[l
         elif f["kind"] == "flagpole":
             f.pop("height_tiles")
             words.append(f"goal flagpole {f['distance']} ahead")
+        elif f["kind"] == "ledge above":
+            f.pop("_near_height", None)
+            words.append(f"ledge {f['height_tiles']} tiles up, {f['distance']} ahead, {f['width_tiles']} wide")
+            continue
+        elif f["kind"] == "side_pipe":
+            f.pop("height_tiles")
+            f["note"] = "the open end of a sideways pipe at Mario's level: walk into it, never jump"
+            words.append(f"sideways pipe opening {f['distance']} ahead, walk into it")
         else:
             words.append(f"{f['kind']} {f['height_tiles']} tiles high, {f['distance']} ahead")
     return features, words
